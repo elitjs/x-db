@@ -14,7 +14,8 @@
     "native:build": "napi build --platform --release --cargo-cwd ../crates/xdb-node --js xdb-native.cjs --dts xdb-native.d.ts .",
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/native.test.js",
-    "example": "npm run build && node dist/example.js"
+    "example": "npm run build && node dist/example.js",
+    "cookbook": "npm run build && node dist/cookbook.js"
   },
   "napi": {
     "binaryName": "xdb-native",

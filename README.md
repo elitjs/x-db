@@ -84,6 +84,17 @@ crates/xdb-node/       napi-rs binding: Rust → Node.js addon
 typescript/            npm package "xdb-native": TS wrapper + tests + example
 ```
 
+## Cookbook — ตัวอย่างครบทุกเคส (รันได้จริง)
+
+```bash
+cd typescript && npm run cookbook
+```
+
+17 เคสใน `typescript/src/cookbook.ts`: ตารางเดี่ยว, binary, JSON, range/prefix/seek,
+realtime CRUD, batch import 10k rows, เลือก durability 3 โหมด, เก็บไฟล์+chunking,
+cache แบบ TTL, counter, session store + ล้างหมดอายุ, key design (เลขเรียงถูก),
+merge ฐาน+delta, compact มือ, error handling, ผูก xdb-server, performance tips
+
 ## ใช้จาก TypeScript (native binding)
 
 Build ครั้งแรก:
