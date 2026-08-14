@@ -69,6 +69,8 @@ struct StoreInner {
     stop_flag: AtomicBool,
     sync_wait: Mutex<()>,
     sync_notifier: Condvar,
+    /// handle ของ periodic-sync thread — Drop จะ join เพื่อรอ lock file ปลดแน่นอน
+    sync_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// ถือ exclusive lock ไว้ตลอดอายุ store — กันอีก process (หรือ instance) เปิด dir เดียวกัน
     _lock_file: File,
 }
@@ -139,13 +141,15 @@ impl XDBStore {
             stop_flag: AtomicBool::new(false),
             sync_wait: Mutex::new(()),
             sync_notifier: Condvar::new(),
+            sync_thread: Mutex::new(None),
             _lock_file: lock_file,
         });
 
         // nosync + sync_interval_ms > 0 → เปิด periodic sync thread
         // (จำกัดช่องเสียข้อมูลตอนไฟดับไว้ ≤ sync_interval_ms โดยไม่ทำให้ put ช้าลง)
         if !inner.options.sync && inner.options.sync_interval_ms > 0 {
-            spawn_periodic_sync(Arc::downgrade(&inner), inner.options.sync_interval_ms);
+            let handle = spawn_periodic_sync(Arc::downgrade(&inner), inner.options.sync_interval_ms);
+            *inner.sync_thread.lock().unwrap() = Some(handle);
         }
 
         Ok(Self { inner })
@@ -386,7 +390,7 @@ impl XDBStore {
 
 /// Background thread: ทุก sync_interval_ms → fsync WAL (โหมด nosync)
 /// ใช้ Weak — เมื่อ store ถูก drop หมด thread ออกเอง และปลุกให้ออกทันทีด้วย condvar
-fn spawn_periodic_sync(weak: Weak<StoreInner>, interval_ms: u64) {
+fn spawn_periodic_sync(weak: Weak<StoreInner>, interval_ms: u64) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let interval = std::time::Duration::from_millis(interval_ms);
         loop {
@@ -411,14 +415,17 @@ fn spawn_periodic_sync(weak: Weak<StoreInner>, interval_ms: u64) {
                 }
             }
         }
-    });
+    })
 }
 
 impl Drop for XDBStore {
     fn drop(&mut self) {
-        // ปลุก periodic-sync thread ให้ออกทันที (ไม่ต้องรอครบ interval → ปลด file lock เร็ว)
+        // ปลุก periodic-sync thread และรอออกจริง (join) → lock file ปลดแน่นอนก่อนคืน control
         self.inner.stop_flag.store(true, Ordering::Relaxed);
         self.inner.sync_notifier.notify_all();
+        if let Some(handle) = self.inner.sync_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
     }
 }
 
