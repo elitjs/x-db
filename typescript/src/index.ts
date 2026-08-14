@@ -8,8 +8,8 @@
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-// dist/index.js -> package root/x-db.cjs
-const native = require("../x-db.cjs") as NativeApi;
+// dist/index.js -> package root/xdb2.cjs
+const native = require("../xdb2.cjs") as NativeApi;
 
 export type KeyValue = string | Uint8Array;
 
@@ -24,7 +24,7 @@ export type BuildInput =
   | Array<Entry>
   | Record<string, KeyValue>;
 
-// ---- types ของ native addon (ดู x-db.d.ts ที่ generate ไว้ด้วยก็ได้) ----
+// ---- types ของ native addon (ดู xdb2.d.ts ที่ generate ไว้ด้วยก็ได้) ----
 
 interface NativeIterEntry {
   key: Buffer;

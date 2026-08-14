@@ -79,7 +79,7 @@ cache 64MB) — จาก test: ตาราง text 100k entries เล็ก�
 src/lib.rs             ไลบรารีหลัก: XDBWriter / XDBReader / BloomFilter / XDBIter
 examples/bench.rs      benchmark
 crates/xdb-node/       napi-rs binding: Rust → Node.js addon
-typescript/            npm package "x-db": TS wrapper + tests + example
+typescript/            npm package "xdb2": TS wrapper + tests + example
 ```
 
 ## Cookbook — ตัวอย่างครบทุกเคส (รันได้จริง)
@@ -107,7 +107,7 @@ npm run build          # tsc → dist/
 ใช้งาน:
 
 ```ts
-import { writeTable, XdbReader } from "x-db";
+import { writeTable, XdbReader } from "xdb2";
 
 writeTable("./demo.xdb", [
   ["alice", "engineer"],
@@ -124,7 +124,7 @@ reader.count;                              // 3
 for (const { key, value } of reader) { /* ... */ }
 
 // merge/compaction: รวมหลายตาราง — ไฟล์หลังสุดชนะเมื่อ key ซ้ำ
-import { mergeTables } from "x-db";
+import { mergeTables } from "xdb2";
 const count = mergeTables(["old.xdb", "new.xdb"], "merged.xdb");
 ```
 
@@ -137,7 +137,7 @@ const count = mergeTables(["old.xdb", "new.xdb"], "merged.xdb");
 รวมทุกความสามารถ (อ่าน/เขียน/อัพเดต/ลบ/ไล่/snapshot) ไว้ในคลาสเดียว บนไฟล์ .xdb ไฟล์เดียว:
 
 ```ts
-import { XDB } from "x-db";
+import { XDB } from "xdb2";
 
 const db = new XDB("./app.xdb");                    // หรือ XDB.open(...)
 // ตัวเลือก: { durability: "safe" | "balanced" | "fast", flushEntries, compactThreshold }
@@ -182,7 +182,7 @@ db.close()?;                                          // เหลือไฟ�
 อยากได้**ไฟล์เดียว**พกไปไหนก็ได้ แต่ยังแก้ไขข้อมูลได้ตลอด — ใช้ `XdbSingleFile`:
 
 ```ts
-import { XdbSingleFile, XdbReader } from "x-db";
+import { XdbSingleFile, XdbReader } from "xdb2";
 
 const db = new XdbSingleFile("./app.xdb");   // ไฟล์เดียว (มีห้องเครื่อง data.xdb.store ข้าง ๆ)
 db.put(["alice", "1"], ["bob", "2"]);        // เขียน/แก้/ลบ แบบ realtime เหมือน XdbStore
@@ -204,7 +204,7 @@ memtable เต็ม (default 4096) จะ flush เป็น layer อัต�
 delete = tombstone, และ **compact อัตโนมัติแบบ background** เมื่อครบ 8 layers (บีบอัด LZ4 — writer ไม่ต้องรอ)
 
 ```ts
-import { XdbStore } from "x-db";
+import { XdbStore } from "xdb2";
 
 const store = new XdbStore("./mydata");          // directory (สร้างให้เอง)
 // ตัวเลือก: { compactThreshold: 8, flushEntries: 4096, sync: true, syncIntervalMs: 0 }

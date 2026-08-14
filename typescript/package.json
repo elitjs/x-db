@@ -1,5 +1,5 @@
 {
-  "name": "x-db",
+  "name": "xdb2",
   "version": "0.3.0",
   "description": "Native Node.js addon (napi-rs) สำหรับเรียกใช้ x-db จาก TypeScript โดยตรง",
   "type": "module",
@@ -7,11 +7,11 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
-    "x-db.cjs",
-    "x-db.d.ts"
+    "xdb2.cjs",
+    "xdb2.d.ts"
   ],
   "scripts": {
-    "native:build": "napi build --platform --release --cargo-cwd ../crates/xdb-node --js x-db.cjs --dts x-db.d.ts .",
+    "native:build": "napi build --platform --release --cargo-cwd ../crates/xdb-node --js xdb2.cjs --dts xdb2.d.ts .",
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/native.test.js",
     "example": "npm run build && node dist/example.js",
@@ -19,7 +19,7 @@
     "bench": "npm run build && node dist/bench.js"
   },
   "napi": {
-    "binaryName": "x-db",
+    "binaryName": "xdb2",
     "targets": [
       "x86_64-pc-windows-msvc",
       "x86_64-unknown-linux-gnu",
