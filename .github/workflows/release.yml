@@ -46,7 +46,7 @@ jobs:
 
       - name: Build native addon
         working-directory: typescript
-        run: npx napi build --platform --release --target ${{ matrix.target }} --cargo-cwd ../crates/xdb-node --js xdb2.cjs --dts xdb2.d.ts .
+        run: npx napi build --platform --release --target ${{ matrix.target }} --cargo-cwd ../crates/xdb-node --js xdb.cjs --dts xdb.d.ts .
 
       - name: Build TypeScript
         working-directory: typescript
@@ -56,11 +56,11 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xdb2-${{ matrix.target }}
+          name: xdb-${{ matrix.target }}
           path: |
             typescript/*.node
-            typescript/xdb2.cjs
-            typescript/xdb2.d.ts
+            typescript/xdb.cjs
+            typescript/xdb.d.ts
             typescript/dist/
 
   publish:
@@ -84,8 +84,8 @@ jobs:
         run: |
           mkdir -p typescript/dist typescript/prebuilds
           FIRST=$(ls artifacts/ | head -1)
-          cp artifacts/$FIRST/xdb2.cjs typescript/
-          cp artifacts/$FIRST/xdb2.d.ts typescript/
+          cp artifacts/$FIRST/xdb.cjs typescript/
+          cp artifacts/$FIRST/xdb.d.ts typescript/
           cp -r artifacts/$FIRST/dist/* typescript/dist/
           for d in artifacts/*/; do cp $d*.node typescript/prebuilds/ 2>/dev/null || true; done
           ls -la typescript/ typescript/prebuilds/
