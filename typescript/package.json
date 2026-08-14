@@ -15,7 +15,8 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/native.test.js",
     "example": "npm run build && node dist/example.js",
-    "cookbook": "npm run build && node dist/cookbook.js"
+    "cookbook": "npm run build && node dist/cookbook.js",
+    "bench": "npm run build && node dist/bench.js"
   },
   "napi": {
     "binaryName": "xdb-native",
