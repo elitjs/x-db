@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { closeSync, existsSync, openSync, statSync, writeFileSync, writeSync } from "node:fs";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mergeTables, writeTable, XdbReader, XdbStore } from "./index.js";
@@ -467,4 +467,94 @@ test("store: sync=false ใช้ได้ปกติ", () => {
   const store = new XdbStore(dir);
   assert.equal(store.getUtf8("fast"), "1");
   store.close();
+});
+
+// ---------------- XdbSingleFile: ไฟล์เดียวจบ ----------------
+
+import { XdbSingleFile } from "./index.js";
+
+test("single-file: put → save → XdbReader เปิดไฟล์เดียวนั้นได้", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-single-"));
+  const file = join(dir, "app.xdb");
+
+  const db = new XdbSingleFile(file);
+  db.put([["a", "1"], ["b", "2"]]);
+  db.save();
+
+  const reader = new XdbReader(file);
+  assert.equal(reader.getUtf8("a"), "1");
+  assert.equal(reader.getUtf8("b"), "2");
+  db.close();
+});
+
+test("single-file: reader เปิดค้างระหว่าง save ไม่พัง (atomic replace)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-single-atomic-"));
+  const file = join(dir, "app.xdb");
+
+  const db = new XdbSingleFile(file);
+  db.put([["v", "รอบแรก"]]);
+  db.save();
+
+  const oldReader = new XdbReader(file); // เปิดค้างไว้ก่อนแทนที่ไฟล์
+  db.put([["v", "รอบสอง"], ["new", "เพิ่ม"]]);
+  db.save(); // ← แทนที่ไฟล์ตอน oldReader ยังถืออยู่
+
+  // reader เก่า: เห็น snapshot ตอนมันเปิด (ไม่พัง ไม่เห็นของใหม่)
+  assert.equal(oldReader.getUtf8("v"), "รอบแรก");
+  // reader ใหม่: เห็นของล่าสุด
+  const fresh = new XdbReader(file);
+  assert.equal(fresh.getUtf8("v"), "รอบสอง");
+  assert.equal(fresh.getUtf8("new"), "เพิ่ม");
+
+  db.close();
+});
+
+test("single-file: exportAndClose → เหลือไฟล์เดียวจริง + เปิดใหม่ seed จากไฟล์", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-single-export-"));
+  const file = join(dir, "app.xdb");
+
+  {
+    const db = new XdbSingleFile(file);
+    db.put([["k1", "v1"], ["k2", "v2"]]);
+    db.delete("k2");
+    db.put([["k3", "v3"]]);
+    db.exportAndClose();
+  }
+
+  // ไม่มีห้องเครื่องเหลือ — ไฟล์เดียวจริง ๆ
+  const files = readdirSync(dir);
+  assert.deepEqual(files, ["app.xdb"]);
+
+  // เปิดใหม่ (จากไฟล์เดียว) — ข้อมูลครบ + สถานะถูกต้อง
+  const db2 = new XdbSingleFile(file);
+  assert.equal(db2.getUtf8("k1"), "v1");
+  assert.equal(db2.getUtf8("k2"), null); // ยังถูกลบอยู่
+  assert.equal(db2.getUtf8("k3"), "v3");
+  // ทำงานต่อได้เรื่อย ๆ
+  db2.put([["k4", "v4"]]);
+  db2.save();
+  assert.equal(new XdbReader(file).getUtf8("k4"), "v4");
+  db2.close();
+});
+
+test("single-file: iter/range/prefix เห็นข้อมูลล่าสุดแม้ยังไม่ save", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-single-iter-"));
+  const db = new XdbSingleFile(join(dir, "app.xdb"));
+
+  db.put([["u:1", "a"], ["u:2", "b"], ["u:3", "c"], ["x:1", "d"]]);
+  const keys = [...db.prefix("u:")].map(({ key }) => Buffer.from(key).toString());
+  assert.deepEqual(keys, ["u:1", "u:2", "u:3"]);
+  assert.equal([...db.range("u:2", "u:3")].length, 1); // end exclusive → เฉพาะ u:2
+  db.close();
+});
+
+test("single-file: save ตอนยังไม่มีข้อมูล → ได้ไฟล์ตารางเปล่าที่ถูกต้อง", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-single-empty-"));
+  const file = join(dir, "app.xdb");
+  const db = new XdbSingleFile(file);
+  db.save();
+  const reader = new XdbReader(file);
+  assert.equal(reader.count, 0);
+  assert.equal(reader.getUtf8("anything"), null);
+  db.close();
 });

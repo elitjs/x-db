@@ -134,6 +134,25 @@ const count = mergeTables(["old.xdb", "new.xdb"], "merged.xdb");
 - `XdbReader` เปิดไฟล์แบบ mmap ครั้งเดียว แล้ว lookup ได้ตลอดอายุ process
 - ไฟล์เสียหาย → throw error (ตรวจ CRC ครั้งแรกที่แตะแต่ละ block)
 
+## XdbSingleFile — ไฟล์ .xdb เดียวจบ (เขียน+อ่าน ไม่พัง)
+
+อยากได้**ไฟล์เดียว**พกไปไหนก็ได้ แต่ยังแก้ไขข้อมูลได้ตลอด — ใช้ `XdbSingleFile`:
+
+```ts
+import { XdbSingleFile, XdbReader } from "xdb-native";
+
+const db = new XdbSingleFile("./app.xdb");   // ไฟล์เดียว (มีห้องเครื่อง data.xdb.store ข้าง ๆ)
+db.put(["alice", "1"], ["bob", "2"]);        // เขียน/แก้/ลบ แบบ realtime เหมือน XdbStore
+db.getUtf8("alice");                          // อ่านเห็นของใหม่สุดเสมอ
+
+db.save();                                    // ★ บีบทุกอย่างแทนที่ app.xdb แบบ atomic
+new XdbReader("./app.xdb").getUtf8("alice"); // คนอื่นเปิดไฟล์เดียวนั้นได้เลย
+// reader ตัวเก่าที่เปิดค้างระหว่าง save ก็ไม่พัง — ยังอ่าน snapshot เดิมของมันต่อได้
+
+db.exportAndClose();                          // ปิด + ลบห้องเครื่อง → เหลือ app.xdb ไฟล์เดียวจริง ๆ
+// เอาไฟล์นี้ไปเครื่องอื่น/แนบอีเมลได้ — เปิดครั้งหน้า seed จากไฟล์อัตโนมัติ
+```
+
 ## XDBStore — สำหรับแอปที่ update แบบ realtime
 
 `writeTable` เหมาะกับข้อมูลนิ่ง แต่ถ้าแอปต้อง put/delete ตลอดเวลา ให้ใช้ `XdbStore`:

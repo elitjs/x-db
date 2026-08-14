@@ -389,3 +389,158 @@ export class XdbStoreIterator implements IterableIterator<StoreEntry> {
     return this;
   }
 }
+
+// ---------------- XdbSingleFile: ไฟล์ .xdb เดียวจบ (เขียน+อ่าน ไม่พัง) ----------------
+
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+} from "node:fs";
+import { join } from "node:path";
+
+/** sleep แบบ sync (Atomics.wait — ใช้ได้ใน main thread ของ Node) */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * ใช้ไฟล์ .xdb **ไฟล์เดียว** ทำทุกอย่าง: สร้าง / อัพเดต / ลบ / อ่าน — ไม่พัง
+ *
+ * หลักการ: ภายนอกเห็นแค่ `data.xdb` ไฟล์เดียว ส่วนงานเขียน realtime ทำใน
+ * ห้องเครื่องข้าง ๆ (`data.xdb.store/`) แล้ว `save()` บีบรวมทุกอย่างเขียนทับ
+ * ไฟล์เดียวแบบ atomic (tmp + rename) — XdbReader ที่เปิดค้างอยู่ก็ไม่พัง
+ * เพราะเห็น snapshot เดิมของตัวเองต่อไปได้
+ *
+ * ```ts
+ * const db = new XdbSingleFile("./app.xdb");
+ * db.put([["a", "1"]]);
+ * db.save();                       // data.xdb ถูกแทนที่แบบ atomic
+ * const r = new XdbReader("./app.xdb"); r.getUtf8("a"); // "1"
+ * db.close();
+ * ```
+ */
+export class XdbSingleFile {
+  readonly #file: string;
+  readonly #dir: string;
+  readonly #store: XdbStore;
+
+  constructor(path: string, options: XdbStoreOptions = {}) {
+    this.#file = path;
+    this.#dir = path + ".store";
+    if (!existsSync(this.#dir)) {
+      mkdirSync(this.#dir, { recursive: true });
+      // มีไฟล์อยู่แล้ว (เคย save ไว้ / เอามาจากเครื่องอื่น) → ใช้เป็นฐาน layer แรก
+      if (existsSync(this.#file)) {
+        copyFileSync(this.#file, join(this.#dir, "000001.xdb"));
+      }
+    }
+    this.#store = new XdbStore(this.#dir, options);
+  }
+
+  /** เพิ่ม/แก้ค่า (upsert) — รับ Array / Map / Object, batch ยิ่งใหญ่ยิ่งเร็ว */
+  put(entries: BuildInput): void {
+    this.#store.put(entries);
+  }
+
+  /** ลบ keys */
+  delete(keys: KeyValue | KeyValue[]): void {
+    this.#store.delete(keys);
+  }
+
+  get(key: KeyValue): Uint8Array | null {
+    return this.#store.get(key);
+  }
+
+  getUtf8(key: KeyValue): string | null {
+    return this.#store.getUtf8(key);
+  }
+
+  has(key: KeyValue): boolean {
+    return this.#store.has(key);
+  }
+
+  /** มุมมองรวมทั้งหมด (รวมของที่ยังไม่ save) เรียงตาม key */
+  iter(): ReturnType<XdbStore["iter"]> {
+    return this.#store.iter();
+  }
+
+  seek(start: KeyValue): ReturnType<XdbStore["seek"]> {
+    return this.#store.seek(start);
+  }
+
+  range(start: KeyValue, end: KeyValue): ReturnType<XdbStore["range"]> {
+    return this.#store.range(start, end);
+  }
+
+  prefix(p: KeyValue): ReturnType<XdbStore["prefix"]> {
+    return this.#store.prefix(p);
+  }
+
+  /**
+   * บีบทุกอย่าง (ฐาน + memtable + layers) รวมเป็นไฟล์เดียวแล้ว**แทนที่ไฟล์เดิมแบบ atomic**
+   * (tmp + rename) — ระหว่างนี้ XdbReader ตัวเก่าที่เปิดค้างอยู่ยังอ่าน snapshot เดิมได้ต่อ
+   */
+  save(): void {
+    // compact รอบแรกเสมอ — flush memtable ลง layer ก่อน (กรณียังไม่มี layer เลย)
+    this.#store.compact();
+    // จากนั้น compact ซ้ำจนเหลือ layer เดียว (รอ background compaction ที่กำลังรวให้จบก่อน)
+    for (;;) {
+      while (this.#store.isCompacting) sleepSync(5);
+      const layers = this.#layerFiles();
+      if (layers.length <= 1) break;
+      this.#store.compact();
+    }
+
+    const layers = this.#layerFiles();
+    const tmp = this.#file + ".tmp";
+    if (layers.length === 0) {
+      // ยังไม่มีข้อมูลเลย → เขียนตารางเปล่าให้ไฟล์มีรูปแบบถูกต้องเสมอ
+      writeTable(tmp, []);
+    } else {
+      copyFileSync(join(this.#dir, layers[0]), tmp);
+    }
+    try {
+      renameSync(tmp, this.#file); // atomic replace (ทางเดียวจบ)
+    } catch (e: unknown) {
+      // Windows: ถ้ามี XdbReader ถือ mmap ของไฟล์เดิมอยู่ rename ทับไม่ได้ (EPERM)
+      // → ลบไฟล์เดิมแบบ POSIX-delete (ชื่อว่างทันที แต่ reader เก่ายังอ่าน snapshot ของมันต่อได้)
+      //   แล้ว rename ตัวใหม่เข้าที่ปกติ
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== "EPERM" && code !== "EACCES" && code !== "ENOTEMPTY" && code !== "EEXIST") throw e;
+      unlinkSync(this.#file);
+      renameSync(tmp, this.#file);
+    }
+  }
+
+  /** เปิด XdbReader บนไฟล์เดียวนั้น (snapshot ณ ตอน save() ล่าสุด) */
+  openSnapshot(): XdbReader {
+    if (!existsSync(this.#file)) {
+      throw new Error("ยังไม่มีไฟล์ — เรียก save() ก่อน");
+    }
+    return new XdbReader(this.#file);
+  }
+
+  /** ปิด store (ข้อมูล durable ในห้องเครื่อง — เปิดใหม่ใช้ต่อได้) */
+  close(): void {
+    this.#store.close();
+  }
+
+  /**
+   * ปิด + save + **ลบห้องเครื่อง** → เหลือ `data.xdb` ไฟล์เดียวจริง ๆ
+   * พกไปเครื่องอื่น / แนบอีเมลได้เลย (เปิดครั้งหน้าจะ seed จากไฟล์นี้อัตโนมัติ)
+   */
+  exportAndClose(): void {
+    this.save();
+    this.#store.close();
+    rmSync(this.#dir, { recursive: true, force: true });
+  }
+
+  #layerFiles(): string[] {
+    return readdirSync(this.#dir).filter((f) => f.endsWith(".xdb"));
+  }
+}
