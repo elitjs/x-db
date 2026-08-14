@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub mod store;
+pub mod singlefile;
 pub mod wal;
+pub use singlefile::XdbSingleFile;
 pub use store::XDBStore;
 
 pub const MAGIC_HEADER: u32 = 0x58444231; // "XDB1"
@@ -1508,6 +1510,94 @@ mod tests {
         let store = XDBStore::open(&dir).unwrap();
         assert_eq!(store.get(b"base:01000").unwrap(), Some(b"big-value-1000".to_vec()));
         assert_eq!(store.get(b"hot:009").unwrap(), Some(b"small-9".to_vec()));
+    }
+
+    // ---- XdbSingleFile ----
+
+    fn temp_single(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xdb_single_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("app.xdb")
+    }
+
+    #[test]
+    fn single_file_save_then_reader_opens() {
+        let path = temp_single("basic");
+        let db = XdbSingleFile::open(&path).unwrap();
+        db.put(&[(b"a", b"1"), (b"b", b"2")]).unwrap();
+        db.save().unwrap();
+
+        let reader = XDBReader::open(&path).unwrap();
+        assert_eq!(reader.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(reader.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn single_file_replace_while_reader_open() {
+        let path = temp_single("atomic");
+        let db = XdbSingleFile::open(&path).unwrap();
+        db.put(&[(b"v", b"round-1")]).unwrap();
+        db.save().unwrap();
+
+        // เปิด reader ค้างไว้ (ถือ mmap ของไฟล์เดิม)
+        let old_reader = XDBReader::open(&path).unwrap();
+
+        db.put(&[(b"v", b"round-2"), (b"new", b"x")]).unwrap();
+        db.save().unwrap(); // ← แทนที่ไฟล์ตอน old_reader ยังถืออยู่ (POSIX-delete path บน Windows)
+
+        // reader เก่า: เห็น snapshot ตอนเปิด — ไม่พัง ไม่เห็นของใหม่
+        assert_eq!(old_reader.get(b"v").unwrap(), Some(b"round-1".to_vec()));
+        // reader ใหม่: เห็นของล่าสุด
+        let fresh = XDBReader::open(&path).unwrap();
+        assert_eq!(fresh.get(b"v").unwrap(), Some(b"round-2".to_vec()));
+        assert_eq!(fresh.get(b"new").unwrap(), Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn single_file_export_and_reseed() {
+        let path = temp_single("export");
+        {
+            let db = XdbSingleFile::open(&path).unwrap();
+            db.put(&[(b"k1", b"v1"), (b"k2", b"v2")]).unwrap();
+            db.delete(&[b"k2"]).unwrap();
+            db.export_and_close().unwrap();
+        }
+        // เหลือไฟล์เดียวจริง ๆ — ไม่มีห้องเครื่อง
+        let dir = path.parent().unwrap();
+        let entries: Vec<String> = std::fs::read_dir(dir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(entries, vec!["app.xdb".to_string()]);
+
+        // เปิดใหม่จากไฟล์เดียว — seed อัตโนมัติ + สถานะถูกต้อง
+        let db = XdbSingleFile::open(&path).unwrap();
+        assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(db.get(b"k2").unwrap(), None); // ยังถูกลบอยู่
+        // ทำงานต่อได้
+        db.put(&[(b"k3", b"v3")]).unwrap();
+        db.save().unwrap();
+        assert_eq!(XDBReader::open(&path).unwrap().get(b"k3").unwrap(), Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn single_file_empty_save() {
+        let path = temp_single("empty");
+        let db = XdbSingleFile::open(&path).unwrap();
+        db.save().unwrap();
+        let reader = XDBReader::open(&path).unwrap();
+        assert_eq!(reader.len(), 0);
+        assert_eq!(reader.get(b"x").unwrap(), None);
+    }
+
+    #[test]
+    fn single_file_iter_sees_unsaved() {
+        let path = temp_single("iter");
+        let db = XdbSingleFile::open(&path).unwrap();
+        db.put(&[(b"u:1", b"a"), (b"u:2", b"b"), (b"x:1", b"c")]).unwrap();
+        let keys: Vec<Vec<u8>> = db.prefix(b"u:").map(|r| r.unwrap().0).collect();
+        assert_eq!(keys, vec![b"u:1".to_vec(), b"u:2".to_vec()]);
     }
 
     /// แปลง String เป็น &'static [u8] เพื่อสร้าง slice ของ entries แบบ local (test เท่านั้น)
