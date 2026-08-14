@@ -265,6 +265,12 @@ impl XdbStore {
     Ok(self.inner()?.memtable_len().min(u32::MAX as usize) as u32)
   }
 
+  /// มี background compaction กำลังรวอยู่หรือไม่
+  #[napi(getter)]
+  pub fn is_compacting(&self) -> Result<bool> {
+    Ok(self.inner()?.is_compacting())
+  }
+
   /// ดัน memtable ลง layer ถาวร + ล้าง WAL (ปกติ auto ตาม flushEntries อยู่แล้ว)
   #[napi]
   pub fn flush(&self) -> Result<()> {

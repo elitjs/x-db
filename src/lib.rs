@@ -1376,10 +1376,77 @@ mod tests {
             store.put(&[(format!("k{i}").as_bytes(), b"v")]).unwrap();
         }
         assert_eq!(store.layer_count(), 3); // ยังไม่ถึง threshold
-        store.put(&[(b"k3", b"v")]).unwrap(); // ตัวที่ 4 → compact อัตโนมัติ
-        assert_eq!(store.layer_count(), 1);
+        store.put(&[(b"k3", b"v")]).unwrap(); // ตัวที่ 4 → compact (background)
+
+        // compaction รันใน thread แยก — รอจนเสร็จ (มี deadline กันค้าง)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.layer_count() != 1 {
+            assert!(std::time::Instant::now() < deadline, "background compaction ไม่จบ");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(store.get(b"k0").unwrap(), Some(b"v".to_vec()));
         assert_eq!(store.get(b"k3").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn store_background_compaction_keeps_data_correct() {
+        let dir = temp_store("bg_compact");
+        let opts = crate::store::StoreOptions {
+            compact_threshold: 4,
+            flush_entries: 1,
+            sync: true,
+        };
+        let store = XDBStore::open_opts(&dir, opts).unwrap();
+
+        // เขียนต่อเนื่อง 30 batches — compaction จะเกิดหลายรอบระหว่างทางแบบ background
+        for round in 0..30u32 {
+            let entries: Vec<(&[u8], &[u8])> = (0..5)
+                .map(|j| {
+                    let k = format!("r{round:03}:j{j}");
+                    let v = format!("v{round}-{j}");
+                    (leak(k), leak(v))
+                })
+                .collect();
+            store.put(&entries).unwrap();
+        }
+
+        // รอ background compaction ที่ค้างอยู่ (ถ้ามี) ให้จบก่อน แล้วปิดท้ายด้วย compact แบบ blocking
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.is_compacting() {
+            assert!(std::time::Instant::now() < deadline, "background compaction ไม่จบ");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        store.compact().unwrap(); // normalize → เหลือ 1 layer
+
+        // ข้อมูลครบทุก batch
+        for round in 0..30u32 {
+            for j in 0..5u32 {
+                let k = format!("r{round:03}:j{j}");
+                let expected = format!("v{round}-{j}");
+                assert_eq!(
+                    store.get(k.as_bytes()).unwrap(),
+                    Some(expected.into_bytes()),
+                    "missing {k}"
+                );
+            }
+        }
+
+        // เปิดใหม่ก็ต้องครบ
+        drop(store);
+        let store = XDBStore::open(&dir).unwrap();
+        assert_eq!(
+            store.get(b"r000:j0").unwrap(),
+            Some(b"v0-0".to_vec())
+        );
+        assert_eq!(
+            store.get(b"r029:j4").unwrap(),
+            Some(b"v29-4".to_vec())
+        );
+    }
+
+    /// แปลง String เป็น &'static [u8] เพื่อสร้าง slice ของ entries แบบ local (test เท่านั้น)
+    fn leak(s: String) -> &'static [u8] {
+        Box::leak(s.into_bytes().into_boxed_slice())
     }
 
     #[test]

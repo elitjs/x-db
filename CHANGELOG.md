@@ -2,6 +2,13 @@
 
 ## Unreleased (v0.3.0)
 
+### Background compaction — writer ไม่ต้องรอ merge อีกต่อไป
+- compaction รวเป็น layer เดียวใน **thread แยก** — put/delete ไม่โดน stall ตอน merge ตารางใหญ่
+- atomic flag กัน compaction ซ้อนกัน + วนรวจนเบากว่า threshold เอง
+- seq จองล่วงหน้า → layer ที่เกิดระหว่าง merge มีลำดับถูกต้องเสมอ
+- `is_compacting()` / TS `store.isCompacting` สำหรับเช็คตอนปิดแอป
+- manual `compact()` ยังเป็น blocking เหมือนเดิม (เหมาะตอน idle)
+
 ### WAL + memtable — เขียนเร็วขึ้น 20-1000 เท่า
 - put/delete เขียนลง **WAL + memtable** แทนการสร้างไฟล์ layer ทุกครั้ง
   - single key: ~0.9ms (รวม fsync) จาก ~5ms

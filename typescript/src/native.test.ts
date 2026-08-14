@@ -296,15 +296,21 @@ test("store: realtime loop 100 puts อ่านกลับทันที", ()
   }
 });
 
-test("store: auto-compact ที่ 8 layers", () => {
+test("store: auto-compact ที่ 8 layers", async () => {
   // flushEntries: 1 → ทุก put กลายเป็น layer ทันที (จะได้เห็น threshold ทำงาน)
   const store = new XdbStore(tempStore("autocompact"), { compactThreshold: 8, flushEntries: 1 });
   for (let i = 0; i < 7; i++) {
     store.put([[`k${i}`, `v${i}`]]);
   }
   assert.equal(store.layerCount, 7);
-  store.put([["k7", "v7"]]); // ตัวที่ 8 → compact
-  assert.equal(store.layerCount, 1);
+  store.put([["k7", "v7"]]); // ตัวที่ 8 → compact (background)
+
+  // รอ background compaction จบ
+  const deadline = Date.now() + 10_000;
+  while ((store.layerCount as number) !== 1) {
+    assert.ok(Date.now() < deadline, "background compaction ไม่จบ");
+    await new Promise((r) => setTimeout(r, 10));
+  }
   for (let i = 0; i < 8; i++) {
     assert.equal(store.getUtf8(`k${i}`), `v${i}`); // ข้อมูลครบหลัง compact
   }

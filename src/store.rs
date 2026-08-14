@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// จำนวน layers ที่ทำให้ compact อัตโนมัติ (0 = ปิด)
@@ -47,7 +47,7 @@ struct Layer {
     reader: Arc<XDBReader>,
 }
 
-pub struct XDBStore {
+struct StoreInner {
     dir: PathBuf,
     layers: RwLock<Vec<Layer>>,
     /// memtable — entries ใหม่สุด (Option = tombstone) อยู่ที่นี่ก่อน flush เป็น layer
@@ -58,8 +58,14 @@ pub struct XDBStore {
     write_lock: Mutex<()>,
     next_seq: AtomicU64,
     options: StoreOptions,
+    /// กัน compact ซ้อนกัน (true = มี background compaction กำลังรว)
+    compacting: AtomicBool,
     /// ถือ exclusive lock ไว้ตลอดอายุ store — กันอีก process (หรือ instance) เปิด dir เดียวกัน
     _lock_file: File,
+}
+
+pub struct XDBStore {
+    inner: Arc<StoreInner>,
 }
 
 impl XDBStore {
@@ -113,33 +119,41 @@ impl XDBStore {
             wal_entries.into_iter().collect();
 
         Ok(Self {
-            dir: dir.as_ref().to_path_buf(),
-            layers: RwLock::new(layers),
-            memtable: RwLock::new(memtable),
-            wal: Mutex::new(wal),
-            write_lock: Mutex::new(()),
-            next_seq: AtomicU64::new(max_seq + 1),
-            options,
-            _lock_file: lock_file,
+            inner: Arc::new(StoreInner {
+                dir: dir.as_ref().to_path_buf(),
+                layers: RwLock::new(layers),
+                memtable: RwLock::new(memtable),
+                wal: Mutex::new(wal),
+                write_lock: Mutex::new(()),
+                next_seq: AtomicU64::new(max_seq + 1),
+                options,
+                compacting: AtomicBool::new(false),
+                _lock_file: lock_file,
+            }),
         })
     }
 
     /// จำนวน layers ปัจจุบัน
     pub fn layer_count(&self) -> usize {
-        self.layers.read().unwrap().len()
+        self.inner.layers.read().unwrap().len()
     }
 
     /// จำนวน entries ใน memtable ที่ยังไม่ได้ flush
     pub fn memtable_len(&self) -> usize {
-        self.memtable.read().unwrap().len()
+        self.inner.memtable.read().unwrap().len()
+    }
+
+    /// มี background compaction กำลังรวอยู่หรือไม่ (ไว้เช็คตอนปิดแอป/testing)
+    pub fn is_compacting(&self) -> bool {
+        self.inner.compacting.load(Ordering::SeqCst)
     }
 
     /// ค้นหา key: memtable (ใหม่สุด) → layers ใหม่ → เก่า (tombstone = ถูกลบ)
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        if let Some(v) = self.memtable.read().unwrap().get(key) {
+        if let Some(v) = self.inner.memtable.read().unwrap().get(key) {
             return Ok(v.clone());
         }
-        let layers = self.layers.read().unwrap();
+        let layers = self.inner.layers.read().unwrap();
         for layer in layers.iter().rev() {
             match layer.reader.get_entry(key)? {
                 Some(Some(v)) => return Ok(Some(v)),
@@ -178,38 +192,61 @@ impl XDBStore {
     fn write_batch(&self, batch: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> io::Result<()> {
         let compact_needed;
         {
-            let _g = self.write_lock.lock().unwrap();
-            self.wal.lock().unwrap().append(&batch)?;
+            let _g = self.inner.write_lock.lock().unwrap();
+            self.inner.wal.lock().unwrap().append(&batch)?;
             {
-                let mut mem = self.memtable.write().unwrap();
+                let mut mem = self.inner.memtable.write().unwrap();
                 for (k, v) in &batch {
                     mem.insert(k.clone(), v.clone());
                 }
             }
-            if self.options.flush_entries > 0
-                && self.memtable.read().unwrap().len() >= self.options.flush_entries
+            if self.inner.options.flush_entries > 0
+                && self.inner.memtable.read().unwrap().len() >= self.inner.options.flush_entries
             {
                 self.flush_locked()?;
             }
-            compact_needed = self.options.compact_threshold > 0
-                && self.layers.read().unwrap().len() >= self.options.compact_threshold;
+            compact_needed = self.inner.options.compact_threshold > 0
+                && self.inner.layers.read().unwrap().len() >= self.inner.options.compact_threshold;
         }
         if compact_needed {
-            self.compact()?;
+            // background: ไม่ให้ caller ต้องรอ merge ตารางใหญ่
+            self.compact_async();
         }
         Ok(())
     }
 
+    /// รวม layers ใน thread แยก — caller ไม่ต้องรอ (ถ้ามี compaction กำลังรวอยู่จะข้ามรอบนี้)
+    pub fn compact_async(&self) {
+        // มี compaction รวอยู่แล้ว → รอรอบหน้า (write_batch ครั้งถัดไปจะ trigger ใหม่)
+        if self.inner.compacting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let inner = self.inner.clone();
+        std::thread::spawn(move || {
+            // วนรวจไปเรื่อย ๆ จนกว่า layers จะเบากว่า threshold
+            // (เพราะ trigger หลักผูกกับ put — รอบสุดท้ายไม่มี put มาปลุกก็ต้องเก็บให้จบเอง)
+            while inner.options.compact_threshold > 0
+                && inner.layers.read().unwrap().len() >= inner.options.compact_threshold
+            {
+                if let Err(e) = compact_layers_sync(&inner) {
+                    eprintln!("x-db: background compaction failed: {e}");
+                    break;
+                }
+            }
+            inner.compacting.store(false, Ordering::SeqCst);
+        });
+    }
+
     /// Flush memtable เป็น layer ใหม่ + ล้าง WAL — เรียกเองได้ (ปกติ auto ตาม flush_entries)
     pub fn flush(&self) -> io::Result<()> {
-        let _g = self.write_lock.lock().unwrap();
+        let _g = self.inner.write_lock.lock().unwrap();
         self.flush_locked()
     }
 
     /// flush โดยถือ write_lock อยู่แล้ว
     fn flush_locked(&self) -> io::Result<()> {
         let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
-            let mem = self.memtable.read().unwrap();
+            let mem = self.inner.memtable.read().unwrap();
             mem.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
         if entries.is_empty() {
@@ -217,8 +254,8 @@ impl XDBStore {
         }
 
         // เขียน layer ก่อน (durable) — ถ้าพังกลางทาง WAL ยังอยู่ ไม่เสียข้อมูล
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let final_path = self.dir.join(format!("{seq:06}.xdb"));
+        let seq = self.inner.next_seq.fetch_add(1, Ordering::SeqCst);
+        let final_path = self.inner.dir.join(format!("{seq:06}.xdb"));
         let tmp = final_path.with_extension("xdb.tmp");
         {
             let mut b = TableBuilder::create(&tmp, entries.len())?;
@@ -239,8 +276,8 @@ impl XDBStore {
         // สลับแบบ atomic ต่อ reader: push layer + clear memtable ใน critical section เดียว
         // (กัน reader ที่เห็น memtable ว่างแต่ layer ยังไม่ขึ้น)
         {
-            let mut mem = self.memtable.write().unwrap();
-            let mut layers = self.layers.write().unwrap();
+            let mut mem = self.inner.memtable.write().unwrap();
+            let mut layers = self.inner.layers.write().unwrap();
             // เก็บเฉพาะ entries ที่เข้าใหม่ระหว่างเขียน layer (BTreeMap ทำให้ range ง่าย)
             layers.push(Layer { path: final_path, reader });
             mem.clear();
@@ -249,47 +286,25 @@ impl XDBStore {
         }
 
         // layer ถาวรแล้ว → ล้าง WAL ได้
-        self.wal.lock().unwrap().reset()?;
+        self.inner.wal.lock().unwrap().reset()?;
         Ok(())
     }
 
     /// รวมทุก layers เป็นไฟล์เดียว — คืนค่าจำนวน layers หลัง compact
     /// tombstone ถูกคงไว้ (กันกรณีลบไฟล์เก่าไม่สำเร็จบน Windows แล้วข้อมูลโผล่อีก)
     pub fn compact(&self) -> io::Result<usize> {
-        let _g = self.write_lock.lock().unwrap();
-
+        let _g = self.inner.write_lock.lock().unwrap();
         // ดัน memtable ลง layer ก่อน จะได้รวมข้อมูลทั้งหมด
         self.flush_locked()?;
-
-        let mut current: Vec<(PathBuf, Arc<XDBReader>)> = {
-            let layers = self.layers.read().unwrap();
-            layers.iter().map(|l| (l.path.clone(), l.reader.clone())).collect()
-        };
-        if current.len() <= 1 {
-            return Ok(current.len());
+        if let Some((seq, merged_path, merged_reader, input_paths)) =
+            merge_all_layers(&self.inner)?
+        {
+            swap_layers_locked(&self.inner, seq, merged_path, merged_reader, &input_paths);
+            for path in &input_paths {
+                let _ = std::fs::remove_file(path);
+            }
         }
-
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let merged_path = self.dir.join(format!("{seq:06}.xdb"));
-        let inputs: Vec<&Path> = current.iter().map(|(p, _)| p.as_path()).collect();
-        // บีบอัด merged layer ด้วย LZ4 — ข้อมูลเย็น (cold) ไฟล์เล็กลง ส่วน layer ร้อนที่เขียนใหม่ยังเร็วเหมือนเดิม
-        merge_tables_with(&inputs, &merged_path, true)?;
-
-        let merged_reader = Arc::new(XDBReader::open(&merged_path)?);
-        let old: Vec<(PathBuf, Arc<XDBReader>)> = {
-            let mut layers = self.layers.write().unwrap();
-            *layers = vec![Layer { path: merged_path, reader: merged_reader }];
-            std::mem::take(&mut current)
-        };
-        let old_paths: Vec<PathBuf> = old.iter().map(|(p, _)| p.clone()).collect();
-        drop(old); // ปล่อย mmap ของ layers เก่าก่อนลบไฟล์ (ถ้าไม่มี in-flight get ถืออยู่)
-
-        // พยายามลบไฟล์เก่า — ถ้าลบไม่ได้ (Windows ยังถืออยู่) ปล่อยไว้เป็น orphan:
-        // ตอนเปิดใหม่มันถูกโหลดเป็น layer เก่า (seq ต่ำกว่า) ซึ่งถูก merged layer กดอยู่เสมอ
-        for path in &old_paths {
-            let _ = std::fs::remove_file(path);
-        }
-        Ok(1)
+        Ok(self.inner.layers.read().unwrap().len())
     }
 
     /// ไล่ "มุมมองปัจจุบัน" ของทั้ง store — รวม memtable — เรียงตาม key,
@@ -300,10 +315,10 @@ impl XDBStore {
 
     /// iterator เริ่มที่ entry แรกที่ key >= start (seek)
     pub fn iter_from(&self, start: &[u8]) -> StoreIter {
-        let layers = self.layers.read().unwrap();
+        let layers = self.inner.layers.read().unwrap();
         let readers: Vec<Arc<XDBReader>> = layers.iter().map(|l| l.reader.clone()).collect();
         let mem: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
-            let m = self.memtable.read().unwrap();
+            let m = self.inner.memtable.read().unwrap();
             m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
         StoreIter::new(readers, mem, start.to_vec())
@@ -329,6 +344,69 @@ impl XDBStore {
         self.iter_from(prefix)
             .take_while(move |r| matches!(r, Ok((k, _)) if k.starts_with(&p)))
     }
+}
+
+/// รวมทุก layers ปัจจุบันเป็นไฟล์เดียว (LZ4) — ขั้นตอน merge ไม่จับ lock เลย
+/// (โหมด background รวนานเท่าไหร่ก็ได้ writer ไปต่อได้)
+/// คืน (seq ของ merged, path, reader, paths ของ inputs) หรือ None ถ้าไม่ต้องรว
+fn merge_all_layers(
+    inner: &StoreInner,
+) -> io::Result<Option<(u64, PathBuf, Arc<XDBReader>, Vec<PathBuf>)>> {
+    let current: Vec<(PathBuf, Arc<XDBReader>)> = {
+        let layers = inner.layers.read().unwrap();
+        layers.iter().map(|l| (l.path.clone(), l.reader.clone())).collect()
+    };
+    if current.len() <= 1 {
+        return Ok(None);
+    }
+
+    // จอง seq ล่วงหน้า → layer ใหม่ที่เกิดระหว่าง merge มี seq สูงกว่าเสมอ ลำดับจึงถูกต้องเสมอ
+    let seq = inner.next_seq.fetch_add(1, Ordering::SeqCst);
+    let merged_path = inner.dir.join(format!("{seq:06}.xdb"));
+    let inputs: Vec<&Path> = current.iter().map(|(p, _)| p.as_path()).collect();
+    // บีบอัด merged layer ด้วย LZ4 — ข้อมูลเย็น (cold) ไฟล์เล็กลง ส่วน layer ร้อนที่เขียนใหม่ยังเร็วเหมือนเดิม
+    merge_tables_with(&inputs, &merged_path, true)?;
+    let merged_reader = Arc::new(XDBReader::open(&merged_path)?);
+    let input_paths: Vec<PathBuf> = current.iter().map(|(p, _)| p.clone()).collect();
+    Ok(Some((seq, merged_path, merged_reader, input_paths)))
+}
+
+/// สลับ merged layer เข้ารายการ — ผู้เรียกต้องถือ write_lock อยู่แล้ว
+/// (ป้องกัน deadlock: std Mutex ไม่ reentrant)
+fn swap_layers_locked(
+    inner: &StoreInner,
+    seq: u64,
+    merged_path: PathBuf,
+    merged_reader: Arc<XDBReader>,
+    input_paths: &[PathBuf],
+) {
+    let mut layers = inner.layers.write().unwrap();
+    // ตัว input ออก (บางตัวอาจถูกรอบก่อนหน้าเอาออกไปแล้ว — ไม่เป็นไร)
+    let input_set: std::collections::HashSet<&Path> = input_paths.iter().map(|p| p.as_path()).collect();
+    layers.retain(|l| !input_set.contains(l.path.as_path()));
+    // แทรก merged ตามลำดับ seq (หลัง layer เก่าที่เหลือ, ก่อน layer ใหม่ที่เกิดระหว่าง merge)
+    let insert_at = layers
+        .iter()
+        .position(|l| layer_seq(&l.path).unwrap_or(0) > seq)
+        .unwrap_or(layers.len());
+    layers.insert(insert_at, Layer { path: merged_path, reader: merged_reader });
+}
+
+/// รวม layers จนเบากว่า threshold — สำหรับ background thread
+fn compact_layers_sync(inner: &StoreInner) -> io::Result<()> {
+    let Some((seq, merged_path, merged_reader, input_paths)) = merge_all_layers(inner)? else {
+        return Ok(());
+    };
+    {
+        let _g = inner.write_lock.lock().unwrap();
+        swap_layers_locked(inner, seq, merged_path, merged_reader, &input_paths);
+    }
+    // พยายามลบไฟล์เก่า — ถ้าลบไม่ได้ (Windows ยังถืออยู่) ปล่อยไว้เป็น orphan:
+    // ตอนเปิดใหม่มันถูกโหลดเป็น layer เก่า (seq ต่ำกว่า) ซึ่งถูก merged layer กดอยู่เสมอ
+    for path in &input_paths {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
 }
 
 /// ชื่อไฟล์ layer = `{seq:06}.xdb` → คืน seq

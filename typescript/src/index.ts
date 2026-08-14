@@ -56,6 +56,7 @@ interface NativeStore {
   close(): void;
   readonly layerCount: number;
   readonly memtableLen: number;
+  readonly isCompacting: boolean;
   flush(): void;
   put(entries: Entry[]): void;
   delete(keys: Array<string | Uint8Array>): void;
@@ -265,6 +266,11 @@ export class XdbStore {
   /** ดัน memtable ลง layer ถาวร + ล้าง WAL (ปกติ auto ตาม flushEntries อยู่แล้ว) */
   flush(): void {
     this.#inner.flush();
+  }
+
+  /** มี background compaction กำลังรวอยู่หรือไม่ (เช็คได้ตอนจะปิดแอป) */
+  get isCompacting(): boolean {
+    return this.#inner.isCompacting;
   }
 
   /** เพิ่ม/แก้ค่า (upsert) — รับ Array / Map / Object, ไม่เรียงก็ได้, key ซ้ำตัวหลังชนะ */

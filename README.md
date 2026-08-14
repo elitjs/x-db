@@ -106,7 +106,7 @@ const count = mergeTables(["old.xdb", "new.xdb"], "merged.xdb");
 `writeTable` เหมาะกับข้อมูลนิ่ง แต่ถ้าแอปต้อง put/delete ตลอดเวลา ให้ใช้ `XdbStore`:
 put เขียน **WAL + memtable** ก่อน (single key ~0.9ms รวม fsync, **batch ~2.2µs/key**),
 memtable เต็ม (default 4096) จะ flush เป็น layer อัตโนมัติ, get = memtable → layers ตัวใหม่ชนะ,
-delete = tombstone, และ **compact อัตโนมัติ** เมื่อครบ 8 layers (บีบอัด LZ4)
+delete = tombstone, และ **compact อัตโนมัติแบบ background** เมื่อครบ 8 layers (บีบอัด LZ4 — writer ไม่ต้องรอ)
 
 ```ts
 import { XdbStore } from "xdb-native";
