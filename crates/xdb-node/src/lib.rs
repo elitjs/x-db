@@ -164,7 +164,10 @@ impl XdbIterator {
         if self.block >= self.reader.block_count() {
           return Ok(None);
         }
-        self.data = self.reader.block_data_at(self.block).map_err(io_err)?.to_vec();
+        let idx = self.block;
+        let payload = self.reader.block_payload(idx).map_err(io_err)?;
+        let entries_len = self.reader.entries_len_of(idx).map_err(io_err)?;
+        self.data = payload.as_slice()[..entries_len].to_vec();
         self.block += 1;
         self.offset = 0;
         continue;

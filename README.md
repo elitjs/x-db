@@ -8,6 +8,7 @@ Read-only key-value store แบบ SSTable (Rust) เรียกใช้จ�
 - **ปลอดภัย**: CRC32 ทุก block + footer, ตรวจความยาว key/value, fsync ตอนเขียน — ไฟล์เสียหายจะได้ error ไม่ใช่ข้อมูลเพี้ยน/crash
 - **Iterator**: ไล่ทั้งตาราง / range scan / prefix scan
 - **Merge/compaction**: รวมหลายตารางเป็นไฟล์เดียวแบบ streaming (ตารางใหญ่ก็ไม่กิน RAM)
+- **LZ4 compression ต่อ block** (format v6): ตาราง/compaction บีบอัดได้ — ข้อมูล text เล็กลง 3-5 เท่า
 - **XDBStore (realtime updates)**: put/delete แบบ LSM-lite — เหมาะกับแอปที่ update ตลอดเวลา
   พร้อม **file locking** (เปิดซ้อนหลาย process ไม่ได้ — กันข้อมูลเสียหาย) และ `close()` ปลดล็อก
 - **seek / range / prefix**: iterator กระโดดไปตำแหน่ง key ได้เลย (ไม่ต้องไล่ตั้งแต่ต้น)
@@ -18,14 +19,17 @@ Read-only key-value store แบบ SSTable (Rust) เรียกใช้จ�
 
 100,000 entries × 100B (ไฟล์ 11.8 MB), Windows x64:
 
-| การทำงาน | เวลา |
+| การทำงาน | เวลา (ไม่บีบอัด) |
 |---|---|
-| build ทั้งตาราง | ~25-50 ms |
-| get เจอ key (สุ่ม, warm) | ~0.7 µs/op |
+| build ทั้งตาราง | ~20 ms |
+| get เจอ key (สุ่ม, warm) | ~1.0 µs/op |
 | get เจอ key เดิมซ้ำ ๆ (hot path ล้วน) | ~190 ns/op |
-| get ไม่เจอ (bloom ตัด) | ~25 ns/op |
-| iterate ทั้งตาราง | ~1 ms |
-| range scan 1,000 keys | ~0.8 ms |
+| get ไม่เจอ (bloom ตัด) | ~155 ns/op |
+| iterate ทั้งตาราง | ~7 ms (คืนค่า owned — รองรับ block บีบอัด) |
+| range scan 1,000 keys | ~3.9 ms |
+
+ตัวเลขบน block ที่บีบอัด: get เจอ ~1µs เท่าเดิมหลัง block cache ร้อน (decompress ครั้งเดียวต่อ block,
+cache 64MB) — จาก test: ตาราง text 100k entries เล็กลง**มากกว่า 2 เท่า**
 
 ## เทียบกับ database อื่น (`cargo run --release -p xdb-bench`)
 
@@ -140,12 +144,13 @@ for entry in reader.iter() {
 }
 ```
 
-## File format (v5)
+## File format (v6)
 
 ```
 [Header 32B]   magic "XDB1" + version + block size
-[Blocks]       ต่อ block (16KB): entries ([klen u16][vlen u32][key][value])
-               + restart array (offset ของทุก 16 entries: u32 × R, R: u16) + CRC32
+[Blocks]       ต่อ block (16KB): payload = entries ([klen u16][vlen u32][key][value])
+               + restart array (u32 × R, R: u16) — อาจถูกบีบอัด LZ4 (ถ้าคุ้ม)
+               แล้วตามด้วย trailer [raw_len u32][CRC32]
 [Bloom]        ขนาดปรับตามจำนวน entries (~1% false positive)
 [Sparse Index] first key + offset + length + num_restarts ของแต่ละ block
                (เก็บ metadata ครบใน index → open อ่านแค่ 3 บริเวณต่อเนื่อง ไม่ต้องแตะ blocks เลย ~0.2ms)
@@ -159,7 +164,7 @@ restart points (เลือกช่วง 16 entries ใน block) → linear 
 ## รัน tests
 
 ```bash
-cargo test                 # ไลบรารี Rust (33 tests รวม corruption detection, merge, seek/range, file lock)
+cargo test                 # ไลบรารี Rust (38 tests รวม compression, corruption, merge, seek/range, file lock)
 cd typescript && npm test  # native binding จาก TS (27 tests)
 npm run example            # ตัวอย่างการใช้งาน
 cargo run --release --example bench   # benchmark

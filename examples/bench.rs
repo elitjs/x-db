@@ -93,8 +93,8 @@ fn main() -> io::Result<()> {
     let range_count = reader
         .iter()
         .map(|r| r.unwrap())
-        .skip_while(|(k, _)| *k < start)
-        .take_while(|(k, _)| *k <= end)
+        .skip_while(|(k, _)| k.as_slice() < start)
+        .take_while(|(k, _)| k.as_slice() <= end)
         .count();
     let range_us = t.elapsed().as_micros();
     println!("range   : {range_count} entries ใน {range_us} µs");

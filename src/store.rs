@@ -6,7 +6,7 @@
 //! - `delete` = เขียน tombstone กด key ใน layer ที่เก่ากว่า
 //! - `compact` = รวมทุก layers เป็นไฟล์เดียว (เกิดอัตโนมัติเมื่อ layers สะสมถึง threshold)
 
-use crate::{parse_entry, merge_tables, TableBuilder, XDBReader};
+use crate::{parse_entry, merge_tables_with, TableBuilder, XDBReader};
 use fs4::fs_std::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{self};
@@ -168,7 +168,8 @@ impl XDBStore {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let merged_path = self.dir.join(format!("{seq:06}.xdb"));
         let inputs: Vec<&Path> = current.iter().map(|(p, _)| p.as_path()).collect();
-        merge_tables(&inputs, &merged_path)?;
+        // บีบอัด merged layer ด้วย LZ4 — ข้อมูลเย็น (cold) ไฟล์เล็กลง ส่วน layer ร้อนที่เขียนใหม่ยังเร็วเหมือนเดิม
+        merge_tables_with(&inputs, &merged_path, true)?;
 
         let merged_reader = Arc::new(XDBReader::open(&merged_path)?);
         let old: Vec<(PathBuf, Arc<XDBReader>)> = {
@@ -302,19 +303,27 @@ impl StoreIter {
                 self.heads[i] = None;
                 return;
             }
-            let data = match reader.block_data_at(self.block[i]) {
+            let idx = self.block[i];
+            let data = match reader.block_payload(idx) {
                 Ok(d) => d,
                 Err(_) => {
                     self.heads[i] = None; // ไฟล์เสีย — หยุด layer นี้ไปเลย (k-way ยังได้ส่วนที่ดี)
                     return;
                 }
             };
-            if self.offset[i] >= data.len() {
+            let entries_len = match reader.entries_len_of(idx) {
+                Ok(n) => n,
+                Err(_) => {
+                    self.heads[i] = None;
+                    return;
+                }
+            };
+            if self.offset[i] >= entries_len {
                 self.block[i] += 1;
                 self.offset[i] = 0;
                 continue;
             }
-            match parse_entry(&data[self.offset[i]..]) {
+            match parse_entry(&data.as_slice()[self.offset[i]..]) {
                 Ok(Some((k, v, consumed))) => {
                     self.offset[i] += consumed;
                     self.heads[i] = Some((k.to_vec(), v.map(|v| v.to_vec())));

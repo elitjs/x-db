@@ -3,19 +3,24 @@ use memmap2::{Mmap, MmapOptions};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub mod store;
 pub use store::XDBStore;
 
 pub const MAGIC_HEADER: u32 = 0x58444231; // "XDB1"
 pub const MAGIC_FOOTER: u32 = 0x454E4458; // "ENDX"
-pub const FORMAT_VERSION: u16 = 5;
+pub const FORMAT_VERSION: u16 = 6;
 pub const BLOCK_SIZE: usize = 16 * 1024; // 16 KB Block Size
 /// ทุก ๆ 16 entries จะบันทึก "restart point" ไว้ท้าย block เพื่อให้ binary search ใน block ได้
 pub const RESTART_INTERVAL: usize = 16;
 /// บิตบนสุดของ v_len = entry นี้เป็น tombstone (คีย์ถูกลบ) — ใช้ใน XDBStore
 pub const TOMBSTONE_FLAG: u32 = 1 << 31;
+/// flag ใน index entry: block นี้ถูกบีบอัดด้วย LZ4
+pub const BLOCK_COMPRESSED: u16 = 1;
+/// block เล็กกว่านี้ไม่บีบอัด (ได้ไบต์คืนน้อยกว่าค่าใช้จ่าย)
+const MIN_COMPRESS_SIZE: usize = 256;
 
 const HEADER_SIZE: usize = 32;
 const FOOTER_SIZE: usize = 40;
@@ -86,6 +91,7 @@ struct BlockIndexEntry {
     offset: u64,
     length: u32,
     num_restarts: u16,
+    flags: u16,
 }
 
 /// เขียนตารางแบบ streaming: `create` → `add` ทีละ entry (key เรียงน้อยไปมาก) → `finish`
@@ -103,11 +109,22 @@ pub struct TableBuilder {
     started: bool,
     current_offset: u64,
     count: u64,
+    /// บีบอัด block ด้วย LZ4 (ถ้าคุ้ม)
+    compression: bool,
 }
 
 impl TableBuilder {
     /// `expected_entries` ใช้กำหนดขนาด bloom filter (ประมาณการได้ก็พอ — เกินจริงหน่อยไม่พัง)
     pub fn create<P: AsRef<Path>>(path: P, expected_entries: usize) -> io::Result<Self> {
+        Self::create_with(path, expected_entries, false)
+    }
+
+    /// เหมือน `create` แต่เลือกได้ว่าจะบีบอัด block ด้วย LZ4 หรือไม่
+    pub fn create_with<P: AsRef<Path>>(
+        path: P,
+        expected_entries: usize,
+        compression: bool,
+    ) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -133,6 +150,7 @@ impl TableBuilder {
             started: false,
             current_offset: HEADER_SIZE as u64,
             count: 0,
+            compression,
         })
     }
 
@@ -222,6 +240,7 @@ impl TableBuilder {
             index_raw.extend_from_slice(&idx.length.to_be_bytes());
             // เก็บ num_restarts ใน index ด้วย → ตอน open ไม่ต้องแตะ tail ของทุก block เลย
             index_raw.extend_from_slice(&(idx.num_restarts as u16).to_be_bytes());
+            index_raw.extend_from_slice(&idx.flags.to_be_bytes());
         }
         self.writer.write_all(&index_raw)?;
         let index_len = index_raw.len() as u32;
@@ -243,21 +262,38 @@ impl TableBuilder {
     }
 
     fn flush_block(&mut self) -> io::Result<()> {
-        // ท้าย block: [restart array: u32 × R][R: u16] แล้วเข้ารหัส CRC ทั้งหมด
+        // payload = entries + restart array [u32 × R][R: u16]
         for r in &self.restarts {
             self.block_buffer.extend_from_slice(&r.to_be_bytes());
         }
         self.block_buffer.extend_from_slice(&(self.restarts.len() as u16).to_be_bytes());
+        let payload_len = self.block_buffer.len();
 
-        self.writer.write_all(&self.block_buffer)?;
-        self.writer.write_all(&crc32(&self.block_buffer).to_be_bytes())?;
+        // บีบอัดด้วย LZ4 ถ้าเปิดใช้และคุ้มจริง (ข้อมูลสุ่มบีบไม่อยู่ก็เก็บแบบ raw)
+        let (stored, flags) = if self.compression && payload_len >= MIN_COMPRESS_SIZE {
+            let compressed = lz4_flex::compress_prepend_size(&self.block_buffer);
+            if compressed.len() < payload_len {
+                (compressed, BLOCK_COMPRESSED)
+            } else {
+                (std::mem::take(&mut self.block_buffer), 0)
+            }
+        } else {
+            (std::mem::take(&mut self.block_buffer), 0)
+        };
+
+        // Block v6: [payload (อาจบีบอัด)][raw_len u32][CRC32 ของ payload ที่เก็บจริง]
+        self.writer.write_all(&stored)?;
+        self.writer.write_all(&(payload_len as u32).to_be_bytes())?;
+        self.writer.write_all(&crc32(&stored).to_be_bytes())?;
         self.index_list.push(BlockIndexEntry {
             first_key: self.block_first_key.clone(),
             offset: self.current_offset,
-            length: (self.block_buffer.len() + CRC_SIZE) as u32,
+            length: (stored.len() + 4 + CRC_SIZE) as u32,
             num_restarts: self.restarts.len() as u16,
+            flags,
         });
-        self.current_offset += (self.block_buffer.len() + CRC_SIZE) as u64;
+        self.current_offset += (stored.len() + 4 + CRC_SIZE) as u64;
+        self.block_buffer = stored; // แทนที่ buffer เดิมที่ถูก take ไป (clear ประหยัดกว่า)
         self.block_buffer.clear();
         self.restarts.clear();
         self.entries_in_block = 0;
@@ -284,6 +320,15 @@ impl XDBWriter {
 /// key ซ้ำกัน: ตารางที่อยู่หลังสุดใน `inputs` ชนะ
 /// เขียนลง `{output}.tmp` แล้วค่อย rename — input ทั้งหมดปลอดภัยแม้ merge จะพังกลางทาง
 pub fn merge_tables<P: AsRef<Path>>(inputs: &[P], output: P) -> io::Result<u64> {
+    merge_tables_with(inputs, output, false)
+}
+
+/// เหมือน `merge_tables` แต่เลือกได้ว่าผลลัพธ์จะบีบอัด block ด้วย LZ4 หรือไม่
+pub fn merge_tables_with<P: AsRef<Path>>(
+    inputs: &[P],
+    output: P,
+    compression: bool,
+) -> io::Result<u64> {
     let output = output.as_ref();
     for input in inputs {
         if input.as_ref() == output {
@@ -301,16 +346,12 @@ pub fn merge_tables<P: AsRef<Path>>(inputs: &[P], output: P) -> io::Result<u64> 
     let expected: usize = readers.iter().map(|r| r.len() as usize).sum();
 
     let tmp = output.with_extension("xdb.tmp");
-    let mut builder = TableBuilder::create(&tmp, expected)?;
+    let mut builder = TableBuilder::create_with(&tmp, expected, compression)?;
 
     let mut iters: Vec<XDBIter> = readers.iter().map(|r| r.iter()).collect();
     let mut heads: Vec<Option<(Vec<u8>, Option<Vec<u8>>)>> = iters
         .iter_mut()
-        .map(|it| {
-            it.next()
-                .transpose()
-                .map(|e| e.map(|(k, v)| (k.to_vec(), v.map(|v| v.to_vec()))))
-        })
+        .map(|it| it.next().transpose())
         .collect::<io::Result<_>>()?;
 
     let mut written: u64 = 0;
@@ -327,10 +368,7 @@ pub fn merge_tables<P: AsRef<Path>>(inputs: &[P], output: P) -> io::Result<u64> 
             let Some((k, v)) = &heads[i] else { continue };
             if k.as_slice() == min_key {
                 value = v.clone();
-                heads[i] = iters[i]
-                    .next()
-                    .transpose()
-                    .map(|e| e.map(|(k, v)| (k.to_vec(), v.map(|v| v.to_vec()))))?;
+                heads[i] = iters[i].next().transpose()?;
             }
         }
 
@@ -389,15 +427,38 @@ struct BlockEntry {
     offset: usize,
     length: usize,
     num_restarts: usize,
+    /// ความยาว payload ก่อนบีบอัด (รวม restart array) — จาก trailer ของ block
+    raw_len: usize,
+    compressed: bool,
 }
 
 impl BlockEntry {
-    /// ความยาวส่วน entries (ไม่รวม restart array + CRC) — คำนวณจาก metadata ใน index
+    /// ความยาวส่วน entries (ไม่รวม restart array) — ใช้ได้ทั้ง block บีบอัดและไม่บีบอัด
     #[inline]
     fn entries_len(&self) -> usize {
-        self.length - CRC_SIZE - 2 - self.num_restarts * 4
+        self.raw_len - 2 - self.num_restarts * 4
     }
 }
+
+/// ข้อมูลของ block หลังผ่าน CRC แล้ว — ไม่บีบอัด = ชี้ตรง mmap (zero-copy),
+/// บีบอัด = decompress แล้ว cache ไว้ใน reader
+pub enum BlockData<'a> {
+    Mmap(&'a [u8]),
+    Owned(Arc<std::vec::Vec<u8>>),
+}
+
+impl BlockData<'_> {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            BlockData::Mmap(s) => s,
+            BlockData::Owned(v) => v,
+        }
+    }
+}
+
+/// งบ RAM สำหรับ cache block ที่ decompress แล้ว (เกิน = ล้างทั้งก้อนแล้วเริ่มใหม่)
+const BLOCK_CACHE_BUDGET: usize = 64 * 1024 * 1024;
 
 pub struct XDBReader {
     mmap: Mmap,
@@ -407,6 +468,9 @@ pub struct XDBReader {
     entry_count: u64,
     /// สถานะ CRC ของแต่ละ block (0 = ยังไม่ตรวจ, 1 = ผ่านแล้ว) — atomic ไม่ต้อง lock
     verified: Vec<AtomicU8>,
+    /// block ที่บีบอัดแล้ว decompress เก็บไว้ (จ่ายค่า decompress ครั้งเดียวต่อ block)
+    block_cache: RwLock<std::collections::HashMap<usize, Arc<std::vec::Vec<u8>>>>,
+    cache_bytes: AtomicU64,
 }
 
 impl XDBReader {
@@ -463,28 +527,42 @@ impl XDBReader {
                 return Err(invalid_data("truncated index entry"));
             }
             let k_len = u16::from_be_bytes(index_data[cursor..cursor + 2].try_into().unwrap()) as usize;
-            if cursor + 16 + k_len > index_data.len() {
+            if cursor + 18 + k_len > index_data.len() {
                 return Err(invalid_data("truncated index entry"));
             }
             let first_key = index_data[cursor + 2..cursor + 2 + k_len].to_vec();
             let offset = u64::from_be_bytes(index_data[cursor + 2 + k_len..cursor + 10 + k_len].try_into().unwrap()) as usize;
             let length = u32::from_be_bytes(index_data[cursor + 10 + k_len..cursor + 14 + k_len].try_into().unwrap()) as usize;
             let num_restarts = u16::from_be_bytes(index_data[cursor + 14 + k_len..cursor + 16 + k_len].try_into().unwrap()) as usize;
-            if offset > len || length > len - offset {
+            let flags = u16::from_be_bytes(index_data[cursor + 16 + k_len..cursor + 18 + k_len].try_into().unwrap());
+            if offset > len || length > len - offset || length < 4 + CRC_SIZE {
                 return Err(invalid_data("block region out of bounds"));
             }
-            if num_restarts == 0 || CRC_SIZE + 2 + num_restarts * 4 > length {
+            // trailer ของ block: [raw_len u32][crc u32] — อ่าน raw_len ได้เลยไม่ต้องแตะ payload
+            let block = &mmap[offset..offset + length];
+            let raw_len = u32::from_be_bytes(block[length - 8..length - 4].try_into().unwrap()) as usize;
+            let compressed = flags & BLOCK_COMPRESSED != 0;
+            if num_restarts == 0 || raw_len < 2 + num_restarts * 4 {
                 return Err(invalid_data("invalid restart array"));
             }
 
-            index.push(BlockEntry { first_key, offset, length, num_restarts });
-            cursor += 16 + k_len;
+            index.push(BlockEntry { first_key, offset, length, num_restarts, raw_len, compressed });
+            cursor += 18 + k_len;
         }
 
         let verified = std::iter::repeat_with(|| AtomicU8::new(0))
             .take(index.len())
             .collect();
-        Ok(Self { mmap, bloom_offset, bloom_len, index, entry_count, verified })
+        Ok(Self {
+            mmap,
+            bloom_offset,
+            bloom_len,
+            index,
+            entry_count,
+            verified,
+            block_cache: RwLock::new(std::collections::HashMap::new()),
+            cache_bytes: AtomicU64::new(0),
+        })
     }
 
     /// จำนวน entries ทั้งหมดในตาราง
@@ -505,10 +583,10 @@ impl XDBReader {
         self.bloom_len
     }
 
-    /// ค้นหาแบบ Zero-Copy: คืนค่าเป็น byte slice ชี้ตรงไปยัง memory ทันที
+    /// ค้นหา key → ค่า (คัดลอกค่าออกมาให้เพราะ block อาจถูกบีบอัดและอยู่ใน cache)
     /// Err = ไฟล์เสียหาย, Ok(None) = ไม่มี key นี้ (หรือเจอ tombstone)
     #[inline]
-    pub fn get(&self, target_key: &[u8]) -> io::Result<Option<&[u8]>> {
+    pub fn get(&self, target_key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         match self.get_entry(target_key)? {
             Some(Some(v)) => Ok(Some(v)),
             _ => Ok(None),
@@ -518,7 +596,7 @@ impl XDBReader {
     /// ค้นหาแบบละเอียด: Some(Some(v)) = เจอค่า, Some(None) = เจอ tombstone, None = ไม่มี key
     /// (XDBStore ใช้ตัวนี้เพื่อแยก "ถูกลบ" ออกจาก "ไม่มี" แล้วหยุดค้น layer ที่เก่ากว่า)
     #[inline]
-    pub fn get_entry(&self, target_key: &[u8]) -> io::Result<Option<Option<&[u8]>>> {
+    pub fn get_entry(&self, target_key: &[u8]) -> io::Result<Option<Option<Vec<u8>>>> {
         // Stage 1: Bloom Filter Check
         if self.bloom_len == 0 || !self.bloom_check(target_key) {
             return Ok(None); // Key ไม่มีแน่นอน 100% ข้ามการ Scan ทันที
@@ -529,14 +607,22 @@ impl XDBReader {
             return Ok(None);
         };
 
-        // Stage 3: ตรวจ CRC ครั้งแรกที่แตะ block แล้ว binary search บน restart points
-        self.ensure_verified(block_idx)?;
-        self.scan_block(block_idx, target_key)
+        // Stage 3: โหลด block (ตรวจ CRC + decompress ถ้าจำเป็น) แล้ว binary search บน restart points
+        let data = self.block_payload(block_idx)?;
+        self.scan_block(&data, block_idx, target_key)
     }
 
     /// ไล่ทุก entries เรียงตาม key (ใช้ทำ range/prefix scan ด้วย skip_while/take_while ได้)
     pub fn iter(&self) -> XDBIter<'_> {
-        XDBIter { reader: self, block: 0, offset: 0, data: &[], done: false, skip_below: None }
+        XDBIter {
+            reader: self,
+            block: 0,
+            offset: 0,
+            data: BlockData::Owned(Arc::new(Vec::new())),
+            data_entries_len: 0,
+            done: false,
+            skip_below: None,
+        }
     }
 
     /// iterator เริ่มที่ entry แรกที่ key >= start (seek) — เร็วกว่าไล่+filter เพราะข้ามไป block ตรง ๆ
@@ -547,39 +633,73 @@ impl XDBReader {
             reader: self,
             block,
             offset: 0,
-            data: &[],
+            data: BlockData::Owned(Arc::new(Vec::new())),
+            data_entries_len: 0,
             done: false,
             skip_below: Some(start.to_vec()),
         }
     }
 
     /// ไล่ keys ในช่วง [start, end) — end เป็น exclusive
-    pub fn range<'a>(
-        &'a self,
+    pub fn range(
+        &self,
         start: &[u8],
         end: &[u8],
-    ) -> impl Iterator<Item = io::Result<(&'a [u8], Option<&'a [u8]>)>> + 'a {
+    ) -> impl Iterator<Item = io::Result<(Vec<u8>, Option<Vec<u8>>)>> + '_ {
         let end = end.to_vec();
         self.iter_from(start)
-            .take_while(move |r| matches!(r, Ok((k, _)) if *k < end.as_slice()))
+            .take_while(move |r| matches!(r, Ok((k, _)) if k.as_slice() < end.as_slice()))
     }
 
     /// ไล่ทุก entries ที่ key ขึ้นต้นด้วย prefix ที่กำหนด
-    pub fn prefix<'a>(
-        &'a self,
+    pub fn prefix(
+        &self,
         prefix: &[u8],
-    ) -> impl Iterator<Item = io::Result<(&'a [u8], Option<&'a [u8]>)>> + 'a {
+    ) -> impl Iterator<Item = io::Result<(Vec<u8>, Option<Vec<u8>>)>> + '_ {
         let p = prefix.to_vec();
         self.iter_from(prefix)
             .take_while(move |r| matches!(r, Ok((k, _)) if k.starts_with(p.as_slice())))
     }
 
-    /// ข้อมูลของ block ที่ i — เฉพาะส่วน entries (สำหรับ iteration)
-    /// ตรวจ checksum เฉพาะครั้งแรกที่แตะ block — ครั้งถัดไปเป็น zero-copy ทันที
-    pub fn block_data_at(&self, i: usize) -> io::Result<&[u8]> {
+    /// payload ของ block ที่ i (ผ่าน CRC แล้ว + decompress ถ้าบีบอัด, cache ไว้)
+    /// ไม่บีบอัด = zero-copy จาก mmap เลย
+    pub fn block_payload(&self, i: usize) -> io::Result<BlockData<'_>> {
         let be = self.index.get(i).ok_or_else(|| invalid_data("block index out of range"))?;
         self.ensure_verified(i)?;
-        Ok(&self.mmap[be.offset..be.offset + be.entries_len()])
+
+        if !be.compressed {
+            // payload = [offset, offset+length-8) — ไม่รวม trailer [raw_len][crc]
+            return Ok(BlockData::Mmap(&self.mmap[be.offset..be.offset + be.length - 8]));
+        }
+
+        // block บีบอัด: หาจาก cache ก่อน ไม่มีค่อย decompress
+        if let Some(hit) = self.block_cache.read().unwrap().get(&i) {
+            return Ok(BlockData::Owned(hit.clone()));
+        }
+        let stored = &self.mmap[be.offset..be.offset + be.length - 8];
+        let payload = lz4_flex::decompress_size_prepended(stored)
+            .map_err(|e| invalid_data(&format!("lz4 decompress failed: {e}")))?;
+        if payload.len() != be.raw_len {
+            return Err(invalid_data("decompressed size mismatch"));
+        }
+        let arc = Arc::new(payload);
+        {
+            let mut cache = self.block_cache.write().unwrap();
+            let bytes = self.cache_bytes.load(Ordering::Relaxed) as usize;
+            if bytes + arc.len() > BLOCK_CACHE_BUDGET {
+                cache.clear();
+                self.cache_bytes.store(0, Ordering::Relaxed);
+            }
+            self.cache_bytes.fetch_add(arc.len() as u64, Ordering::Relaxed);
+            cache.insert(i, arc.clone());
+        }
+        Ok(BlockData::Owned(arc))
+    }
+
+    /// ส่วน entries ของ block ที่ i (ไม่รวม restart array) — เข้า pair กับ block_payload
+    pub fn entries_len_of(&self, i: usize) -> io::Result<usize> {
+        let be = self.index.get(i).ok_or_else(|| invalid_data("block index out of range"))?;
+        Ok(be.entries_len())
     }
 
     /// ตรวจ CRC ของ block (cache ด้วย atomic — จ่ายครั้งเดียวต่อ block)
@@ -589,9 +709,9 @@ impl XDBReader {
         }
         let be = &self.index[i];
         let block = &self.mmap[be.offset..be.offset + be.length];
-        let data_len = be.length - CRC_SIZE;
-        let stored = u32::from_be_bytes(block[data_len..].try_into().unwrap());
-        if crc32(&block[..data_len]) != stored {
+        let payload_end = be.length - 8;
+        let stored_crc = u32::from_be_bytes(block[payload_end + 4..].try_into().unwrap());
+        if crc32(&block[..payload_end]) != stored_crc {
             return Err(invalid_data("block checksum mismatch"));
         }
         self.verified[i].store(1, Ordering::Release);
@@ -620,11 +740,17 @@ impl XDBReader {
 
     /// Binary search บน restart points แล้วไล่ไม่เกิน RESTART_INTERVAL entries
     /// คืนค่า: Some(Some(v)) = เจอ, Some(None) = เจอ tombstone, None = ไม่มี
-    fn scan_block(&self, block_idx: usize, target_key: &[u8]) -> io::Result<Option<Option<&[u8]>>> {
+    fn scan_block(
+        &self,
+        data: &BlockData<'_>,
+        block_idx: usize,
+        target_key: &[u8],
+    ) -> io::Result<Option<Option<Vec<u8>>>> {
         let be = &self.index[block_idx];
+        let payload = data.as_slice();
         let entries_len = be.entries_len();
-        let block = &self.mmap[be.offset..be.offset + entries_len];
-        let restarts = &self.mmap[be.offset + entries_len..be.offset + be.length - CRC_SIZE - 2];
+        let block = &payload[..entries_len];
+        let restarts = &payload[entries_len..]; // restart array + R u16 อยู่ท้าย payload
 
         // key ของ restart point ที่ i
         let restart_key = |i: usize| -> io::Result<&[u8]> {
@@ -655,7 +781,7 @@ impl XDBReader {
         let mut rest = &block[start..];
         while let Some((key, val, consumed)) = parse_entry(rest)? {
             if key == target_key {
-                return Ok(Some(val));
+                return Ok(Some(val.map(|v| v.to_vec())));
             }
             if key > target_key {
                 break;
@@ -673,20 +799,24 @@ pub struct XDBIter<'a> {
     /// index ของ block *ถัดไป* ที่จะโหลด
     block: usize,
     offset: usize,
-    /// data ของ block ปัจจุบัน (ผ่าน CRC แล้ว) — ว่าง = ยังไม่โหลดอะไรเลย
-    data: &'a [u8],
+    /// payload ของ block ปัจจุบัน (ผ่าน CRC แล้ว) — Owned ว่าง = ยังไม่โหลดอะไรเลย
+    data: BlockData<'a>,
+    /// ความยาวส่วน entries ของ block ปัจจุบัน
+    data_entries_len: usize,
     done: bool,
     /// (seek) ข้าม entries ที่ key น้อยกว่าค่านี้ — keys เรียงอยู่แล้วเลยข้ามได้เรื่อย ๆ
     skip_below: Option<Vec<u8>>,
 }
 
 impl XDBIter<'_> {
-    /// โหลด block ถัดไป (พร้อมตรวจ CRC ครั้งเดียว) — false = หมดแล้ว
+    /// โหลด block ถัดไป (ตรวจ CRC + decompress ถ้าจำเป็น) — false = หมดแล้ว
     fn advance_block(&mut self) -> io::Result<bool> {
         while self.block < self.reader.index.len() {
-            match self.reader.block_data_at(self.block) {
+            let i = self.block;
+            match self.reader.block_payload(i) {
                 Ok(d) => {
                     self.block += 1;
+                    self.data_entries_len = self.reader.entries_len_of(i)?;
                     self.data = d;
                     self.offset = 0;
                     return Ok(true);
@@ -702,23 +832,23 @@ impl XDBIter<'_> {
     }
 }
 
-impl<'a> Iterator for XDBIter<'a> {
+impl Iterator for XDBIter<'_> {
     /// value = None หมายถึง tombstone (คีย์ถูกลบ)
-    type Item = io::Result<(&'a [u8], Option<&'a [u8]>)>;
+    type Item = io::Result<(Vec<u8>, Option<Vec<u8>>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
         }
         loop {
-            if self.offset >= self.data.len() {
+            if self.offset >= self.data_entries_len {
                 match self.advance_block() {
                     Ok(true) => continue,
                     Ok(false) => return None,
                     Err(e) => return Some(Err(e)),
                 }
             }
-            return match parse_entry(&self.data[self.offset..]) {
+            return match parse_entry(&self.data.as_slice()[self.offset..]) {
                 Err(e) => {
                     self.done = true;
                     Some(Err(e))
@@ -732,11 +862,12 @@ impl<'a> Iterator for XDBIter<'a> {
                         }
                         self.skip_below = None; // ผ่านจุดเริ่มแล้ว ไม่ต้องเช็คอีก
                     }
-                    Some(Ok((k, v)))
+                    Some(Ok((k.to_vec(), v.map(|v| v.to_vec()))))
                 }
                 Ok(None) => {
-                    // ไม่ถึง case นี้ในทางปฏิบัติ (เราเช็ค offset < data.len แล้ว) — ป้องกันไว้
-                    self.data = &[];
+                    // เศษไบต์ปลาย block — ข้ามไป block ถัดไป
+                    self.data = BlockData::Owned(Arc::new(Vec::new()));
+                    self.data_entries_len = 0;
                     continue;
                 }
             };
@@ -776,7 +907,7 @@ mod tests {
         assert_eq!(reader.len(), 2000);
         assert!(reader.block_count() > 1);
         for (k, v) in &entries {
-            assert_eq!(reader.get(k).unwrap(), Some(v.as_slice()));
+            assert_eq!(reader.get(k).unwrap(), Some(v.clone()));
         }
     }
 
@@ -829,7 +960,7 @@ mod tests {
         XDBWriter::write_table(&path, &refs).unwrap();
 
         let reader = XDBReader::open(&path).unwrap();
-        assert_eq!(reader.get(b"big").unwrap(), Some(big_val.as_slice()));
+        assert_eq!(reader.get(b"big").unwrap(), Some(big_val.clone()));
     }
 
     #[test]
@@ -843,7 +974,7 @@ mod tests {
 
         let reader = XDBReader::open(&path).unwrap();
         for (k, v) in &map {
-            assert_eq!(reader.get(k).unwrap(), Some(v.as_slice()));
+            assert_eq!(reader.get(k).unwrap(), Some(v.clone()));
         }
     }
 
@@ -918,7 +1049,7 @@ mod tests {
         let reader = XDBReader::open(&path).unwrap();
         let collected: Vec<(Vec<u8>, Vec<u8>)> = reader
             .iter()
-            .map(|r| r.map(|(k, v)| (k.to_vec(), v.unwrap().to_vec())).unwrap())
+            .map(|r| r.map(|(k, v)| (k, v.unwrap())).unwrap())
             .collect();
 
         assert_eq!(collected.len(), entries.len());
@@ -938,9 +1069,9 @@ mod tests {
         let range: Vec<Vec<u8>> = reader
             .iter()
             .map(|r| r.unwrap())
-            .skip_while(|(k, _)| *k < start.as_slice())
-            .take_while(|(k, _)| *k <= end.as_slice())
-            .map(|(k, _)| k.to_vec())
+            .skip_while(|(k, _)| k.as_slice() < start.as_slice())
+            .take_while(|(k, _)| k.as_slice() <= end.as_slice())
+            .map(|(k, _)| k)
             .collect();
         assert_eq!(range.len(), 11); // keys 40..=50
         assert_eq!(range.first().unwrap().as_slice(), &start[..]);
@@ -984,7 +1115,7 @@ mod tests {
         let reader = XDBReader::open(&path).unwrap();
         assert_eq!(reader.len(), 1000);
         for (k, v) in &entries {
-            assert_eq!(reader.get(k).unwrap(), Some(v.as_slice()));
+            assert_eq!(reader.get(k).unwrap(), Some(v.clone()));
         }
     }
 
@@ -1016,11 +1147,11 @@ mod tests {
 
         let reader = XDBReader::open(&out).unwrap();
         assert_eq!(reader.len(), 5);
-        assert_eq!(reader.get(b"a").unwrap(), Some(&b"newest-a"[..])); // จาก t3
-        assert_eq!(reader.get(b"b").unwrap(), Some(&b"new-b"[..])); // จาก t2
-        assert_eq!(reader.get(b"c").unwrap(), Some(&b"c1"[..]));
-        assert_eq!(reader.get(b"d").unwrap(), Some(&b"d2"[..]));
-        assert_eq!(reader.get(b"e").unwrap(), Some(&b"e3"[..]));
+        assert_eq!(reader.get(b"a").unwrap(), Some(b"newest-a".to_vec())); // จาก t3
+        assert_eq!(reader.get(b"b").unwrap(), Some(b"new-b".to_vec())); // จาก t2
+        assert_eq!(reader.get(b"c").unwrap(), Some(b"c1".to_vec()));
+        assert_eq!(reader.get(b"d").unwrap(), Some(b"d2".to_vec()));
+        assert_eq!(reader.get(b"e").unwrap(), Some(b"e3".to_vec()));
 
         // เรียงถูกต้อง
         let keys: Vec<Vec<u8>> = reader.iter().map(|r| r.unwrap().0.to_vec()).collect();
@@ -1046,8 +1177,8 @@ mod tests {
 
         let reader = XDBReader::open(&out).unwrap();
         assert_eq!(reader.len(), 1000);
-        assert_eq!(reader.get(b"key:00000000").unwrap(), Some(&b"even-0"[..]));
-        assert_eq!(reader.get(b"key:00000999").unwrap(), Some(&b"odd-999"[..]));
+        assert_eq!(reader.get(b"key:00000000").unwrap(), Some(b"even-0".to_vec()));
+        assert_eq!(reader.get(b"key:00000999").unwrap(), Some(b"odd-999".to_vec()));
     }
 
     #[test]
@@ -1086,16 +1217,16 @@ mod tests {
         b.finish().unwrap();
 
         let reader = XDBReader::open(&path).unwrap();
-        assert_eq!(reader.get(b"a").unwrap(), Some(&b"1"[..]));
+        assert_eq!(reader.get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(reader.get(b"b").unwrap(), None); // tombstone = ไม่เจอ
         assert_eq!(reader.get_entry(b"b").unwrap(), Some(None)); // แต่ get_entry บอกว่าเป็น tombstone
-        assert_eq!(reader.get(b"c").unwrap(), Some(&b"3"[..]));
+        assert_eq!(reader.get(b"c").unwrap(), Some(b"3".to_vec()));
         assert_eq!(reader.len(), 3); // tombstone ก็นับเป็น entry
 
         // iterator เห็น value = None
         let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = reader
             .iter()
-            .map(|r| r.map(|(k, v)| (k.to_vec(), v.map(|x| x.to_vec()))).unwrap())
+            .map(|r| r.unwrap())
             .collect();
         assert_eq!(entries[1], (b"b".to_vec(), None));
     }
@@ -1115,7 +1246,7 @@ mod tests {
 
         merge_tables(&[&t1, &t2], &out).unwrap();
         let reader = XDBReader::open(&out).unwrap();
-        assert_eq!(reader.get(b"a").unwrap(), Some(&b"1"[..]));
+        assert_eq!(reader.get(b"a").unwrap(), Some(b"1".to_vec()));
         assert_eq!(reader.get(b"b").unwrap(), None); // ยังถูกลบอยู่
         assert_eq!(reader.get_entry(b"b").unwrap(), Some(None));
     }
@@ -1262,7 +1393,7 @@ mod tests {
 
         // เริ่มที่กลางตาราง
         let start = format!("key:{:010}", 700);
-        let keys: Vec<&[u8]> = reader.iter_from(start.as_bytes()).map(|r| r.unwrap().0).collect();
+        let keys: Vec<Vec<u8>> = reader.iter_from(start.as_bytes()).map(|r| r.unwrap().0).collect();
         assert_eq!(keys.first().unwrap(), &start.as_bytes());
         assert_eq!(keys.len(), 2000 - 700);
 
@@ -1338,5 +1469,136 @@ mod tests {
         drop(store); // ปลดล็อก
         let reopened = XDBStore::open(&dir); // ต้องเปิดได้
         assert!(reopened.is_ok());
+    }
+
+    // ---- compression (format v6) ----
+
+    #[test]
+    fn compressed_round_trip() {
+        let raw = temp_path("comp_raw");
+        let comp = temp_path("comp_lz4");
+
+        // ข้อมูลอัดง่าย (text ซ้ำ) — 100k entries
+        let entries: Vec<(String, String)> = (0..100_000)
+            .map(|i| (format!("key:{:012}", i), format!("value-of-entry-{}-", i).repeat(3)))
+            .collect();
+
+        let refs: Vec<(&[u8], &[u8])> = entries.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())).collect();
+        XDBWriter::write_table(&raw, &refs).unwrap();
+        let mut b = TableBuilder::create_with(&comp, entries.len(), true).unwrap();
+        for (k, v) in &refs {
+            b.add(k, v).unwrap();
+        }
+        b.finish().unwrap();
+
+        let raw_size = std::fs::metadata(&raw).unwrap().len();
+        let comp_size = std::fs::metadata(&comp).unwrap().len();
+        assert!(comp_size < raw_size / 2, "compressed {comp_size} should be < half of {raw_size}");
+
+        // get + iter ต้องถูกต้องครบ
+        let reader = XDBReader::open(&comp).unwrap();
+        assert_eq!(reader.len(), 100_000);
+        assert_eq!(reader.get(entries[0].0.as_bytes()).unwrap(), Some(entries[0].1.as_bytes().to_vec()));
+        assert_eq!(reader.get(entries[99_999].0.as_bytes()).unwrap(), Some(entries[99_999].1.as_bytes().to_vec()));
+        let count = reader.iter().count();
+        assert_eq!(count, 100_000);
+
+        // seek/range บนตารางบีบอัด
+        let rcount = reader.range(entries[500].0.as_bytes(), entries[1500].0.as_bytes()).count();
+        assert_eq!(rcount, 1000);
+    }
+
+    #[test]
+    fn incompressible_data_stored_raw() {
+        let comp = temp_path("comp_random");
+        // ข้อมูลสุ่มบีบไม่อยู่ — ต้อง fallback เป็นเก็บ raw และยังอ่านถูก
+        let entries: Vec<(String, Vec<u8>)> = (0..5000)
+            .map(|i| {
+                let mut v = vec![0u8; 200];
+                let mut x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) | 1;
+                for b in v.iter_mut() {
+                    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                    *b = x as u8;
+                }
+                (format!("key:{:06}", i), v)
+            })
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = entries.iter().map(|(k, v)| (k.as_bytes(), v.as_slice())).collect();
+
+        let mut b = TableBuilder::create_with(&comp, entries.len(), true).unwrap();
+        for (k, v) in &refs {
+            b.add(k, v).unwrap();
+        }
+        b.finish().unwrap();
+
+        let reader = XDBReader::open(&comp).unwrap();
+        for (k, v) in entries.iter().take(50) {
+            assert_eq!(reader.get(k.as_bytes()).unwrap(), Some(v.clone()));
+        }
+    }
+
+    #[test]
+    fn corrupted_compressed_block_is_detected() {
+        let comp = temp_path("comp_corrupt");
+        let entries: Vec<(String, String)> = (0..2000)
+            .map(|i| (format!("key:{:06}", i), format!("compressible-value-{}", i).repeat(5)))
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = entries.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())).collect();
+        let mut b = TableBuilder::create_with(&comp, entries.len(), true).unwrap();
+        for (k, v) in &refs {
+            b.add(k, v).unwrap();
+        }
+        b.finish().unwrap();
+
+        // flip ไบต์ใน payload ของ block แรก (header 32B + offset 10)
+        let mut raw = std::fs::read(&comp).unwrap();
+        raw[HEADER_SIZE + 10] ^= 0xFF;
+        std::fs::write(&comp, &raw).unwrap();
+
+        let reader = XDBReader::open(&comp).unwrap();
+        let err = match reader.get(entries[10].0.as_bytes()) {
+            Err(e) => e,
+            Ok(_) => panic!("corrupted compressed block must be detected"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn merge_with_compression() {
+        let t1 = temp_path("merge_comp1");
+        let t2 = temp_path("merge_comp2");
+        let out = temp_path("merge_comp_out");
+
+        let refs1: Vec<(&[u8], &[u8])> = vec![(b"a", b"1"), (b"b", b"2")];
+        let refs2: Vec<(&[u8], &[u8])> = vec![(b"b", b"2-new"), (b"c", b"3")];
+        XDBWriter::write_table(&t1, &refs1).unwrap();
+        XDBWriter::write_table(&t2, &refs2).unwrap();
+
+        let written = merge_tables_with(&[&t1, &t2], &out, true).unwrap();
+        assert_eq!(written, 3);
+        let reader = XDBReader::open(&out).unwrap();
+        assert_eq!(reader.get(b"b").unwrap(), Some(b"2-new".to_vec()));
+        assert_eq!(reader.get(b"c").unwrap(), Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn store_compact_produces_compressed_layer() {
+        let dir = temp_store("compact_lz4");
+        {
+            let store = XDBStore::open_with(&dir, 0).unwrap();
+            for i in 0..4 {
+                let entries: Vec<(String, String)> = (0..100)
+                    .map(|j| (format!("k:{j:04}"), format!("value-{i}-{j}-").repeat(3)))
+                    .collect();
+                let refs: Vec<(&[u8], &[u8])> = entries.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())).collect();
+                store.put(&refs).unwrap();
+            }
+            assert_eq!(store.compact().unwrap(), 1);
+            // อ่านหลัง compact (ผ่าน block บีบอัด)
+            assert_eq!(store.get(b"k:0042").unwrap().unwrap().len(), "value-3-42-".repeat(3).len());
+        }
+        // เปิดใหม่ — ยังถูกต้อง
+        let store = XDBStore::open(&dir).unwrap();
+        assert_eq!(store.get(b"k:0000").unwrap().unwrap().len(), "value-3-0-".repeat(3).len());
     }
 }

@@ -162,8 +162,8 @@ async fn get_key(
             return Ok(Json(GetResponse {
                 table: name,
                 key_b64: B64.encode(&key),
-                value_b64: B64.encode(value),
-                value_utf8: String::from_utf8(value.to_vec()).ok(),
+                value_b64: B64.encode(&value),
+                value_utf8: String::from_utf8(value).ok(),
             }));
         }
     }
