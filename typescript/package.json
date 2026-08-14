@@ -36,10 +36,12 @@
   "license": "MIT",
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",
-    "@types/node": "^22.20.1",
     "typescript": "^5.6.0"
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@types/node": "^22.20.1"
   }
 }
