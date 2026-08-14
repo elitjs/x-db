@@ -1652,7 +1652,7 @@ mod tests {
 
         // ค่าเดิมไม่ใช่ตัวเลข → error ชัดเจน
         db.set("text", "hello").unwrap();
-        let err = db.add("text", 1).unwrap_err();
+        let err = db.add("text", 1.0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         db.close().unwrap();
 
