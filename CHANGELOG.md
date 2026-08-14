@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased (v0.3.0)
+## v0.3.0 (2026-08-15)
+
+### XDB — API เดียวจบ (TypeScript + Rust)
+- `XDB`: set/setMany/get/getBytes/has/del + iter/prefix/range/seek + snapshot/save/close
+- ค่ารับ string/Uint8Array/object (JSON อัตโนมัติ ถอดกลับให้ตอน get)
+- `durability: "safe" | "balanced" | "fast"` แทนการตั้ง sync flags มือ
+- `XdbSingleFile` (TS+Rust): ไฟล์ .xdb เดียว + save() แบบ atomic
+  (บน Windows ใช้ POSIX-delete ผ่าน SetFileInformationByHandle — reader เก่าไม่พัง)
+- Rust: XDBOptions/XDBDurability + set_many/get_utf8/del/snapshot ฯลฯ
 
 ### Cleanup — ลบ code ที่ไม่ได้ใช้
 - ลบ xdb-server (HTTP mode) + dependencies axum/tokio/serde/serde_json/base64

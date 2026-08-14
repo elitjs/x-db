@@ -1,6 +1,6 @@
 {
   "name": "x-db",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Native Node.js addon (napi-rs) สำหรับเรียกใช้ x-db จาก TypeScript โดยตรง",
   "type": "module",
   "main": "dist/index.js",
