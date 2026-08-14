@@ -39,7 +39,7 @@ jobs:
           node-version: 22
       - run: npm install
       # build + test native addon บน platform นี้ (ชื่อไฟล์ .node ต่างกันตาม platform)
-      - run: napi build --platform --release --cargo-cwd ../crates/xdb-node --js xdb-native.cjs --dts xdb-native.d.ts .
+      - run: npm run native:build
       - run: npm run build
       - run: npm test
 
