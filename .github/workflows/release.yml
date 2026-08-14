@@ -83,9 +83,9 @@ jobs:
       - name: Assemble package
         run: |
           mkdir -p typescript/dist typescript/prebuilds
-          cp artifacts/*/x-db.cjs typescript/
-          cp artifacts/*/x-db.d.ts typescript/
-          cp -r artifacts/*/dist/* typescript/dist/
+          cp -f artifacts/*/x-db.cjs typescript/
+          cp -f artifacts/*/x-db.d.ts typescript/
+          cp -rf artifacts/*/dist/* typescript/dist/
           cp artifacts/*/*.node typescript/prebuilds/ 2>/dev/null || true
           ls -la typescript/ typescript/prebuilds/
 
