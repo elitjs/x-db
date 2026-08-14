@@ -134,6 +134,35 @@ const count = mergeTables(["old.xdb", "new.xdb"], "merged.xdb");
 - `XdbReader` เปิดไฟล์แบบ mmap ครั้งเดียว แล้ว lookup ได้ตลอดอายุ process
 - ไฟล์เสียหาย → throw error (ตรวจ CRC ครั้งแรกที่แตะแต่ละ block)
 
+## XDB — API เดียวจบ (แนะนำเริ่มที่นี่)
+
+รวมทุกความสามารถ (อ่าน/เขียน/อัพเดต/ลบ/ไล่/snapshot) ไว้ในคลาสเดียว บนไฟล์ .xdb ไฟล์เดียว:
+
+```ts
+import { XDB } from "xdb-native";
+
+const db = new XDB("./app.xdb");                    // หรือ XDB.open(...)
+// ตัวเลือก: { durability: "safe" | "balanced" | "fast", flushEntries, compactThreshold }
+
+db.set("user:1", { name: "สมชาย", age: 30 });        // object → JSON ให้อัตโนมัติ
+db.set("note", "hello");                             // string เก็บตรง / Uint8Array ก็ได้
+db.setMany({ a: "1", b: "2" });                       // batch (ยิ่งเยอะยิ่งเร็ว)
+
+db.get("user:1");        // { name: "สมชาย", age: 30 } — ถอด JSON กลับมาให้แล้ว
+db.getBytes("note");      // อยากได้ bytes ดิบ
+db.has("note");           // true
+db.set("user:1", { name: "สมชาย", age: 31 });         // update บนไฟล์เดียวกัน
+db.del("note", "a");      // ลบกี่ตัวก็ได้
+
+for (const e of db.prefix("user:")) { /* ไล่/ช่วง/seek ครบ */ }
+const snap = db.snapshot();  // XdbReader เร็วสุด (~1µs/get) แชร์ไฟล์ให้คนอื่นอ่าน
+
+db.save();   // บีบเป็นไฟล์เดียวแบบ atomic (reader เก่าไม่พัง)
+db.close();  // save + เหลือไฟล์เดียวพกไปไหนก็ได้ — เปิดใหม่ข้อมูลครบ
+```
+
+ไฟล์ที่ได้ใช้ร่วมกับ `writeTable`/`XDBReader` ได้ทั้งสองทาง
+
 ## XdbSingleFile — ไฟล์ .xdb เดียวจบ (เขียน+อ่าน ไม่พัง)
 
 อยากได้**ไฟล์เดียว**พกไปไหนก็ได้ แต่ยังแก้ไขข้อมูลได้ตลอด — ใช้ `XdbSingleFile`:

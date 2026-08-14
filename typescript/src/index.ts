@@ -544,3 +544,186 @@ export class XdbSingleFile {
     return readdirSync(this.#dir).filter((f) => f.endsWith(".xdb"));
   }
 }
+
+// ---------------- XDB: API เดียวจบ (อ่าน/เขียน/อัพเดต/ลบ บนไฟล์เดียว) ----------------
+
+/** ค่าที่ใส่ได้: string เก็บตรง ๆ / Uint8Array เก็บ bytes / object จะ JSON ให้อัตโนมัติ */
+export type XDBValue = string | Uint8Array | Record<string, unknown> | unknown[];
+
+/** ระดับความปลอดภัยของข้อมูล (แทนการตั้ง sync/syncIntervalMs มือ) */
+export type XDBDurability =
+  /** fsync ทุก operation — ไฟดับไม่เสียข้อมูลเลย (put ~1ms) */
+  | "safe"
+  /** put เร็ว (~5µs) + ซิงก์ดิสก์ทุก 200ms — ไฟดับเสียได้สูงสุด 200ms (แนะนำ) */
+  | "balanced"
+  /** เร็วสุด ไม่รอดิสก์ — เหมาะกับ cache/ข้อมูลสร้างใหม่ได้ */
+  | "fast";
+
+export interface XDBOptions {
+  durability?: XDBDurability;
+  /** entries ใน memtable ก่อน flush เป็น layer (default 4096) */
+  flushEntries?: number;
+  /** จำนวน layers ที่ trigger compact อัตโนมัติ (default 8, 0 = ปิด) */
+  compactThreshold?: number;
+}
+
+/** ค่าที่ได้คืนจาก get/iter — object ถูก JSON.parse กลับมาให้แล้ว */
+export type XDBDecoded = string | Uint8Array | Record<string, unknown> | unknown[];
+
+function decodeValue(v: Uint8Array): XDBDecoded {
+  try {
+    const s = new TextDecoder("utf-8", { fatal: true }).decode(v);
+    const c = s.charCodeAt(0);
+    // { หรือ [ นำหน้า → ลอง JSON (เก็บผ่าน set แบบ object)
+    if (c === 0x7b || c === 0x5b) {
+      try {
+        return JSON.parse(s) as Record<string, unknown> | unknown[];
+      } catch {
+        return s;
+      }
+    }
+    return s;
+  } catch {
+    return v; // ไม่ใช่ UTF-8 → bytes ดิบ
+  }
+}
+
+function encodeValue(v: XDBValue): string | Uint8Array {
+  return typeof v === "string" || v instanceof Uint8Array ? v : JSON.stringify(v);
+}
+
+export interface XDBEntry {
+  key: string | Uint8Array;
+  value: XDBDecoded;
+}
+
+/**
+ * XDB — API เดียวจบบน**ไฟล์ .xdb ไฟล์เดียว**
+ * รวมทุกอย่างที่เคยแยกเป็น writeTable / XdbReader / XdbStore / XdbSingleFile ไว้ในคลาสเดียว
+ *
+ * ```ts
+ * const db = new XDB("./app.xdb");         // หรือ XDB.open("./app.xdb")
+ * db.set("user:1", { name: "สมชาย", age: 30 });
+ * db.set("note", "hello");
+ * db.get("user:1");                         // { name: "สมชาย", age: 30 }
+ * db.set("user:1", { name: "สมชายใหม่" });  // update ได้บนไฟล์เดียวกัน
+ * db.delete("note");
+ * for (const e of db.prefix("user:")) { }
+ * db.save();                                // บีบเป็นไฟล์เดียวแบบ atomic
+ * db.close();
+ * ```
+ */
+export class XDB {
+  readonly #sf: XdbSingleFile;
+
+  constructor(path: string, options: XDBOptions = {}) {
+    const durability = options.durability ?? "safe";
+    const storeOpts: XdbStoreOptions =
+      durability === "safe"
+        ? {}
+        : durability === "balanced"
+          ? { sync: false, syncIntervalMs: 200 }
+          : { sync: false };
+    this.#sf = new XdbSingleFile(path, {
+      ...storeOpts,
+      flushEntries: options.flushEntries,
+      compactThreshold: options.compactThreshold,
+    });
+  }
+
+  /** เปิด database (มาตรว่ากับ new XDB) */
+  static open(path: string, options: XDBOptions = {}): XDB {
+    return new XDB(path, options);
+  }
+
+  /** ตั้งค่า — string เก็บตรง / Uint8Array เก็บ bytes / object แปลง JSON ให้อัตโนมัติ */
+  set(key: KeyValue, value: XDBValue): void {
+    const encoded = encodeValue(value);
+    this.#sf.put([[key, encoded] as [KeyValue, string | Uint8Array]]);
+  }
+
+  /** ตั้งหลายค่าในคำสั่งเดียว (batch — ยิ่งเยอะยิ่งเร็ว ~2-5µs/key) */
+  setMany(entries: Array<[KeyValue, XDBValue]> | Record<string, XDBValue> | Map<KeyValue, XDBValue>): void {
+    const list: Array<[KeyValue, string | Uint8Array]> = [];
+    const push = (k: KeyValue, v: XDBValue): void => {
+      list.push([k, encodeValue(v)] as [KeyValue, string | Uint8Array]);
+    };
+    if (entries instanceof Map) {
+      for (const [k, v] of entries) push(k, v);
+    } else if (Array.isArray(entries)) {
+      for (const [k, v] of entries) push(k, v);
+    } else {
+      for (const [k, v] of Object.entries(entries)) push(k, v);
+    }
+    this.#sf.put(list);
+  }
+
+  /** อ่านค่า — object ที่เก็บไว้ได้กลับมาเป็น object (JSON ให้แล้ว) / bytes ถ้าไม่ใช่ UTF-8 */
+  get<T = XDBDecoded>(key: KeyValue): T | null {
+    const v = this.#sf.get(key);
+    return v === null ? null : (decodeValue(v) as T);
+  }
+
+  /** อ่านค่าแบบ bytes ดิบเสมอ (ไม่ decode) */
+  getBytes(key: KeyValue): Uint8Array | null {
+    return this.#sf.get(key);
+  }
+
+  has(key: KeyValue): boolean {
+    return this.#sf.has(key);
+  }
+
+  /** ลบ — รับกี่ key ก็ได้: del("a") หรือ del("a", "b", "c") */
+  del(...keys: KeyValue[]): void {
+    if (keys.length === 0) return;
+    this.#sf.delete(keys);
+  }
+
+  /** ไล่ทั้งหมดเรียงตาม key */
+  iter(): IterableIterator<XDBEntry> {
+    return mapEntries(this.#sf.iter(), decodeValue);
+  }
+
+  /** ไล่เฉพาะ key ที่ขึ้นต้นด้วย prefix */
+  prefix(p: KeyValue): IterableIterator<XDBEntry> {
+    return mapEntries(this.#sf.prefix(p), decodeValue);
+  }
+
+  /** ไล่ช่วง [start, end) — end exclusive */
+  range(start: KeyValue, end: KeyValue): IterableIterator<XDBEntry> {
+    return mapEntries(this.#sf.range(start, end), decodeValue);
+  }
+
+  /** เริ่มไล่จาก key >= start */
+  seek(start: KeyValue): IterableIterator<XDBEntry> {
+    return mapEntries(this.#sf.seek(start), decodeValue);
+  }
+
+  /**
+   * บีบทุกอย่างเข้าไฟล์ .xdb ไฟล์เดียวแบบ atomic —
+   * หลังจากนี้ใครก็เปิดไฟล์นี้ด้วย XDBReader/writeTable ecosystem ได้
+   * (reader ตัวเก่าที่เปิดค้างอยู่ก็ไม่พัง)
+   */
+  save(): void {
+    this.#sf.save();
+  }
+
+  /** เปิดอ่านแบบ snapshot (เร็วสุด ~0.5-1.4µs/get) — เห็นข้อมูล ณ ตอน save() ล่าสุด */
+  snapshot(): XdbReader {
+    return this.#sf.openSnapshot();
+  }
+
+  /** ปิด + save + เหลือไฟล์เดียวพกไปไหนก็ได้ (เปิดครั้งหน้าข้อมูลอยู่ครบ) */
+  close(): void {
+    this.#sf.exportAndClose();
+  }
+}
+
+function* mapEntries(
+  it: IterableIterator<{ key: Uint8Array; value: Uint8Array }>,
+  decode: (v: Uint8Array) => XDBDecoded,
+): IterableIterator<XDBEntry> {
+  for (const e of it) {
+    yield { key: e.key, value: decode(e.value) };
+  }
+}

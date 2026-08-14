@@ -558,3 +558,101 @@ test("single-file: save ตอนยังไม่มีข้อมูล → 
   assert.equal(reader.getUtf8("anything"), null);
   db.close();
 });
+
+// ---------------- XDB: API เดียวจบ ----------------
+
+import { XDB } from "./index.js";
+
+test("XDB: set/get/update/delete บนไฟล์เดียว — ครบวงจร", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-unified-"));
+  const file = join(dir, "app.xdb");
+
+  {
+    const db = new XDB(file);
+    db.set("user:1", { name: "สมชาย", age: 30 });   // object → JSON อัตโนมัติ
+    db.set("note", "hello");                          // string ตรง ๆ
+    db.setMany({ "a": "1", "b": "2", "c": "3" });     // batch จาก object
+    assert.deepEqual(db.get("user:1"), { name: "สมชาย", age: 30 });
+    assert.equal(db.get("note"), "hello");
+
+    // update บนไฟล์เดียวกัน
+    db.set("user:1", { name: "สมชาย", age: 31 });
+    assert.deepEqual(db.get("user:1"), { name: "สมชาย", age: 31 });
+
+    // delete แบบ variadic
+    db.del("a", "b");
+    assert.equal(db.get("a"), null);
+    assert.equal(db.get("b"), null);
+    assert.equal(db.get("c"), "3");
+    assert.equal(db.has("c"), true);
+
+    // binary
+    db.set("bin", new Uint8Array([1, 2, 255]));
+    assert.deepEqual(db.getBytes("bin"), new Uint8Array([1, 2, 255]));
+
+    // prefix / range
+    assert.deepEqual(
+      [...db.prefix("user:")].map((e) => e.value),
+      [{ name: "สมชาย", age: 31 }],
+    );
+    assert.equal([...db.range("b", "d")].length, 2); // "bin" กับ "c" (a, b ถูกลบแล้ว)
+
+    db.close(); // save + เหลือไฟล์เดียว
+  }
+
+  // เปิดใหม่ — ข้อมูลครบ
+  {
+    const db = XDB.open(file);
+    assert.deepEqual(db.get("user:1"), { name: "สมชาย", age: 31 });
+    assert.equal(db.get("c"), "3");
+    db.close();
+  }
+});
+
+test("XDB: ไฟล์ที่ได้ใช้ร่วมกับ XDBReader / writeTable ecosystem ได้", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-unified-interop-"));
+  const file = join(dir, "app.xdb");
+
+  // สร้างด้วย writeTable เดิม → เปิดด้วย XDB แก้ต่อได้
+  writeTable(file, [["seed:1", "from-writeTable"]]);
+  const db = new XDB(file);
+  assert.equal(db.get("seed:1"), "from-writeTable");
+  db.set("seed:2", "added-by-XDB");
+  db.save();
+
+  // แล้ว XDBReader เดิมก็อ่านต่อได้
+  const reader = new XdbReader(file);
+  assert.equal(reader.getUtf8("seed:1"), "from-writeTable");
+  assert.equal(reader.getUtf8("seed:2"), "added-by-XDB");
+  db.close();
+});
+
+test("XDB: durability — balanced/fast ใช้ได้เหมือนกันหมด", () => {
+  for (const durability of ["safe", "balanced", "fast"] as const) {
+    const dir = mkdtempSync(join(tmpdir(), `xdb-unified-${durability}-`));
+    const db = new XDB(join(dir, "app.xdb"), { durability });
+    db.set("k", "v");
+    assert.equal(db.get("k"), "v");
+    db.close();
+    const db2 = new XDB(join(dir, "app.xdb"));
+    assert.equal(db2.get("k"), "v");
+    db2.close();
+  }
+});
+
+test("XDB: snapshot — เปิดอ่านเร็วสุดจากไฟล์เดียว", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-unified-snap-"));
+  const db = new XDB(join(dir, "app.xdb"));
+  db.setMany(Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`k:${i}`, String(i)])));
+  db.save();
+
+  const snap = db.snapshot();
+  assert.equal(snap.getUtf8("k:42"), "42");
+  assert.equal(snap.count, 100);
+
+  // set ต่อ → snapshot เดิมยังเป็นของเดิม / db เห็นของใหม่
+  db.set("k:42", "updated");
+  assert.equal(snap.getUtf8("k:42"), "42");
+  assert.equal(db.get("k:42"), "updated");
+  db.close();
+});
