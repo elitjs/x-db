@@ -132,7 +132,7 @@ const count = mergeTables(["old.xdb", "new.xdb"], "merged.xdb");
 - `XdbReader` เปิดไฟล์แบบ mmap ครั้งเดียว แล้ว lookup ได้ตลอดอายุ process
 - ไฟล์เสียหาย → throw error (ตรวจ CRC ครั้งแรกที่แตะแต่ละ block)
 
-## XDB — API เดียวจบ (แนะนำเริ่มที่นี่)
+## XDB — API เดียวจบ (แนะนำเริ่มที่นี่ — มีทั้ง TypeScript และ Rust)
 
 รวมทุกความสามารถ (อ่าน/เขียน/อัพเดต/ลบ/ไล่/snapshot) ไว้ในคลาสเดียว บนไฟล์ .xdb ไฟล์เดียว:
 
@@ -157,6 +157,21 @@ const snap = db.snapshot();  // XdbReader เร็วสุด (~1µs/get) แ�
 
 db.save();   // บีบเป็นไฟล์เดียวแบบ atomic (reader เก่าไม่พัง)
 db.close();  // save + เหลือไฟล์เดียวพกไปไหนก็ได้ — เปิดใหม่ข้อมูลครบ
+```
+
+**Rust ก็มี API เดียวกัน:**
+
+```rust
+use x_db::XDB;
+
+let db = XDB::open("app.xdb")?;                     // หรือ open_with(path, XDBOptions { durability, .. })
+db.set("user:1", "สมชาย")?;                          // &str หรือ &[u8] ก็ได้
+db.set_many(&[("a", "1"), ("b", "2")])?;
+db.get_utf8("user:1")?;                              // Some("สมชาย")
+db.del(&["a", "b"])?;
+for entry in db.prefix(b"user:") { let (_k, _v) = entry?; }
+db.save()?;                                           // atomic — reader เก่าไม่พัง
+db.close()?;                                          // เหลือไฟล์เดียวพกไปไหนก็ได้
 ```
 
 ไฟล์ที่ได้ใช้ร่วมกับ `writeTable`/`XDBReader` ได้ทั้งสองทาง

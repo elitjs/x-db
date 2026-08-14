@@ -8,8 +8,10 @@ use std::sync::{Arc, RwLock};
 
 pub mod store;
 pub mod singlefile;
+pub mod xdb;
 pub mod wal;
 pub use singlefile::XdbSingleFile;
+pub use xdb::{XDB, XDBDurability, XDBOptions};
 pub use store::XDBStore;
 
 pub const MAGIC_HEADER: u32 = 0x58444231; // "XDB1"
@@ -1588,6 +1590,128 @@ mod tests {
         db.put(&[(b"u:1", b"a"), (b"u:2", b"b"), (b"x:1", b"c")]).unwrap();
         let keys: Vec<Vec<u8>> = db.prefix(b"u:").map(|r| r.unwrap().0).collect();
         assert_eq!(keys, vec![b"u:1".to_vec(), b"u:2".to_vec()]);
+    }
+
+    // ---- XDB: API เดียวจบ (Rust) ----
+
+    fn temp_xdb(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xdb_facade_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("app.xdb")
+    }
+
+    #[test]
+    fn xdb_full_crud_on_one_file() {
+        let path = temp_xdb("crud");
+        {
+            let db = XDB::open(&path).unwrap();
+            db.set("user:1", "สมชาย").unwrap();               // &str
+            db.set_many(&[("a", "1"), ("b", "2"), ("c", "3")]).unwrap();
+            assert_eq!(db.get_utf8("user:1").unwrap(), Some("สมชาย".to_string()));
+            assert_eq!(db.get_utf8("c").unwrap(), Some("3".to_string()));
+
+            // update บนไฟล์เดียวกัน
+            db.set("user:1", "สมชาย (อัพเดต)").unwrap();
+            assert_eq!(db.get_utf8("user:1").unwrap(), Some("สมชาย (อัพเดต)".to_string()));
+
+            // del หลายตัว
+            db.del(&["a", "b"]).unwrap();
+            assert_eq!(db.get_utf8("a").unwrap(), None);
+            assert_eq!(db.has("c").unwrap(), true);
+
+            // binary ผ่าน &[u8]
+            db.set(b"bin", [1u8, 2, 255].as_slice()).unwrap();
+            assert_eq!(db.get(b"bin").unwrap(), Some(vec![1, 2, 255]));
+
+            // prefix
+            let keys: Vec<Vec<u8>> = db.prefix(b"user:").map(|r| r.unwrap().0).collect();
+            assert_eq!(keys, vec![b"user:1".to_vec()]);
+
+            db.close().unwrap(); // save + เหลือไฟล์เดียว
+        }
+        // เปิดใหม่ — ข้อมูลครบ
+        let db = XDB::open(&path).unwrap();
+        assert_eq!(db.get_utf8("user:1").unwrap(), Some("สมชาย (อัพเดต)".to_string()));
+        assert_eq!(db.get_utf8("c").unwrap(), Some("3".to_string()));
+    }
+
+    #[test]
+    fn xdb_interop_with_writer_and_reader() {
+        let path = temp_xdb("interop");
+        // สร้างด้วย write_table เดิม → XDB เปิดแก้ต่อได้
+        let refs: Vec<(&[u8], &[u8])> = vec![(b"seed:1", b"from-writer")];
+        XDBWriter::write_table(&path, &refs).unwrap();
+
+        let db = XDB::open(&path).unwrap();
+        assert_eq!(db.get_utf8("seed:1").unwrap(), Some("from-writer".to_string()));
+        db.set("seed:2", "added-by-XDB").unwrap();
+        db.save().unwrap();
+
+        // XDBReader เดิมอ่านผลลัพธ์ได้
+        let reader = XDBReader::open(&path).unwrap();
+        assert_eq!(reader.get(b"seed:1").unwrap(), Some(b"from-writer".to_vec()));
+        assert_eq!(reader.get(b"seed:2").unwrap(), Some(b"added-by-XDB".to_vec()));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn xdb_durability_variants() {
+        use crate::XDBDurability::*;
+        for (name, dur) in [("safe", Safe), ("balanced", Balanced), ("fast", Fast)] {
+            let path = temp_xdb(name);
+            let db = XDB::open_with(&path, XDBOptions { durability: dur, ..Default::default() }).unwrap();
+            db.set("k", "v").unwrap();
+            assert_eq!(db.get_utf8("k").unwrap(), Some("v".to_string()));
+            db.close().unwrap();
+
+            let db2 = XDB::open(&path).unwrap();
+            assert_eq!(db2.get_utf8("k").unwrap(), Some("v".to_string()), "durability {name}");
+        }
+    }
+
+    #[test]
+    fn xdb_snapshot_sees_last_save() {
+        let path = temp_xdb("snap");
+        let db = XDB::open(&path).unwrap();
+        let entries: Vec<(String, String)> = (0..100).map(|i| (format!("k:{i:03}"), i.to_string())).collect();
+        let refs: Vec<(&str, &str)> = entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        db.set_many(&refs).unwrap();
+        db.save().unwrap();
+
+        let snap = db.snapshot().unwrap();
+        assert_eq!(snap.get(b"k:042").unwrap(), Some(b"42".to_vec()));
+        assert_eq!(snap.len(), 100);
+
+        // set ต่อ → snapshot เดิมยังเป็นของเดิม / db เห็นของใหม่
+        db.set("k:042", "updated").unwrap();
+        assert_eq!(snap.get(b"k:042").unwrap(), Some(b"42".to_vec()));
+        assert_eq!(db.get_utf8("k:042").unwrap(), Some("updated".to_string()));
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn xdb_seek_and_range() {
+        let path = temp_xdb("seek");
+        let db = XDB::open(&path).unwrap();
+        let entries: Vec<(String, String)> =
+            (0..50).map(|i| (format!("item:{i:03}"), i.to_string())).collect();
+        let refs: Vec<(&str, &str)> = entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        db.set_many(&refs).unwrap();
+
+        let seeked: Vec<String> = db
+            .seek(b"item:045")
+            .map(|r| r.unwrap().0)
+            .map(|k| String::from_utf8(k).unwrap())
+            .collect();
+        assert_eq!(seeked.len(), 5); // 045..049
+
+        let ranged: Vec<String> = db
+            .range(b"item:010", b"item:013")
+            .map(|r| String::from_utf8(r.unwrap().0).unwrap())
+            .collect();
+        assert_eq!(ranged, vec!["item:010", "item:011", "item:012"]); // end exclusive
+        db.close().unwrap();
     }
 
     /// แปลง String เป็น &'static [u8] เพื่อสร้าง slice ของ entries แบบ local (test เท่านั้น)

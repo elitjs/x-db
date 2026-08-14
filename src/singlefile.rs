@@ -67,6 +67,16 @@ impl XdbSingleFile {
         self.store.prefix(prefix)
     }
 
+    /// เริ่มไล่จาก key >= start
+    pub fn seek(&self, start: &[u8]) -> crate::store::StoreIter {
+        self.store.iter_from(start)
+    }
+
+    /// เข้าถึง XDBStore ข้างใน (สำหรับ API ขั้นสูง)
+    pub fn store(&self) -> &XDBStore {
+        &self.store
+    }
+
     /// เปิด XDBReader บนไฟล์เดียวนั้น (snapshot ณ ตอน save() ล่าสุด)
     pub fn open_snapshot(&self) -> io::Result<XDBReader> {
         if !self.file.exists() {
