@@ -2,10 +2,10 @@
  * Mongo — document layer สไตล์ MongoDB Node.js driver บน XDB
  *
  * ```ts
- * import { XDB, Mongo } from "xdb-native";
+ * import { XDB } from "xdb-native";
  *
- * const mdb = new Mongo(new XDB("./app.xdb"));
- * const users = mdb.collection("users");
+ * const db = new XDB("./app.xdb");
+ * const users = db.collection("users");
  *
  * users.insertOne({ name: "สมชาย", age: 30 });            // → { insertedId }
  * users.insertMany([{ name: "สมหญิง", age: 25 }, ...]);    // → { insertedCount }
@@ -286,31 +286,6 @@ export class FindCursor<T extends MongoDoc> implements Iterable<T> {
       if (matches(value as T, this.#filter)) out.push(value as T);
     }
     return out;
-  }
-}
-
-// ---- Mongo ----
-
-export class Mongo {
-  readonly #db: XDB;
-
-  constructor(db: XDB) {
-    this.#db = db;
-  }
-
-  /** เข้าถึง collection (ไม่ต้องสร้างล่วงหน้า — เกิดเองตอน insert แรก เหมือน MongoDB) */
-  collection<T extends MongoDoc = MongoDoc>(name: string): Collection<T> {
-    return new Collection<T>(this.#db, name);
-  }
-
-  /** บีบทุกอย่างเข้าไฟล์ .xdb ไฟล์เดียวแบบ atomic */
-  save(): void {
-    this.#db.save();
-  }
-
-  /** ปิด + save + เหลือไฟล์เดียวพกไปไหนก็ได้ */
-  close(): void {
-    this.#db.close();
   }
 }
 

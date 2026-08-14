@@ -174,13 +174,13 @@ db.save()?;                                           // atomic — reader เ�
 db.close()?;                                          // เหลือไฟล์เดียวพกไปไหนก็ได้
 ```
 
-### Mongo layer — API สไตล์ MongoDB Node.js driver
+### Document API — สไตล์ MongoDB Node.js driver (`db.collection()`)
 
 ```ts
-import { XDB, Mongo } from "xdb-native";
+import { XDB } from "xdb-native";
 
-const mdb = new Mongo(new XDB("./app.xdb"));
-const users = mdb.collection("users");
+const db = new XDB("./app.xdb");
+const users = db.collection("users");
 
 users.insertOne({ name: "สมชาย", age: 30 });           // _id สร้างให้อัตโนมัติ
 users.insertMany([{ name: "สมหญิง", age: 25 }]);
@@ -195,7 +195,7 @@ users.updateMany({ status: "inactive" }, { $set: { archived: true } });
 users.deleteMany({ status: "inactive" });
 users.countDocuments({ age: { $gt: 20 } });
 
-mdb.close();
+db.close();
 ```
 
 รองรับ: filter `$and/$or/$nor/$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$regex`

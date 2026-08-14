@@ -659,12 +659,12 @@ test("XDB: snapshot — เปิดอ่านเร็วสุดจาก�
 
 // ---------------- Mongo layer: MongoDB-style API ----------------
 
-import { Mongo } from "./index.js";
+import { type MongoDoc } from "./index.js";
 
 test("Mongo: insert / findOne / findById / find", () => {
   const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-"));
-  const mdb = new Mongo(new XDB(join(dir, "app.xdb")));
-  const users = mdb.collection("users");
+  const db = new XDB(join(dir, "app.xdb"));
+  const users = db.collection("users");
 
   const { insertedId } = users.insertOne({ name: "สมชาย", age: 30, role: "admin" });
   assert.ok(typeof insertedId === "string" && insertedId.length > 0);
@@ -693,9 +693,9 @@ test("Mongo: insert / findOne / findById / find", () => {
 
   // sort + skip + limit
   const top = users.find({}).sort({ age: -1 }).limit(2).toArray();
-  assert.deepEqual(top.map((d) => d.age), [35, 30]);
+  assert.deepEqual(top.map((d: MongoDoc) => d.age as number), [35, 30]);
   const page2 = users.find({}).sort({ age: 1 }).skip(2).limit(2).toArray();
-  assert.deepEqual(page2.map((d) => d.age), [25, 30]);
+  assert.deepEqual(page2.map((d: MongoDoc) => d.age as number), [25, 30]);
 
   // $or / $and / $in
   assert.equal(users.find({ $or: [{ role: "admin" }, { age: { $lt: 15 } }] }).count(), 2);
@@ -706,8 +706,8 @@ test("Mongo: insert / findOne / findById / find", () => {
 
 test("Mongo: update operators ($set/$inc/$push/$unset) + dot notation", () => {
   const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-upd-"));
-  const mdb = new Mongo(new XDB(join(dir, "app.xdb")));
-  const users = mdb.collection("users");
+  const db = new XDB(join(dir, "app.xdb"));
+  const users = db.collection("users");
 
   const { insertedId } = users.insertOne({
     name: "สมชาย",
@@ -746,8 +746,8 @@ test("Mongo: update operators ($set/$inc/$push/$unset) + dot notation", () => {
 
 test("Mongo: deleteOne / deleteMany / drop", () => {
   const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-del-"));
-  const mdb = new Mongo(new XDB(join(dir, "app.xdb")));
-  const logs = mdb.collection("logs");
+  const db = new XDB(join(dir, "app.xdb"));
+  const logs = db.collection("logs");
 
   logs.insertMany([
     { level: "info", msg: "a" },
@@ -770,16 +770,16 @@ test("Mongo: persistence — ปิดแล้วเปิดใหม่ ข�
   const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-persist-"));
   const file = join(dir, "app.xdb");
   {
-    const mdb = new Mongo(new XDB(file));
-    mdb.collection("users").insertMany([
+    const db = new XDB(file);
+    db.collection("users").insertMany([
       { name: "อา", score: 10 },
       { name: "บี", score: 20 },
     ]);
-    mdb.close(); // เหลือไฟล์เดียว
+    db.close(); // เหลือไฟล์เดียว
   }
   {
-    const mdb = new Mongo(new XDB(file));
-    const users = mdb.collection("users");
+    const db = new XDB(file);
+    const users = db.collection("users");
     assert.equal(users.countDocuments(), 2);
     assert.equal(users.findOne({ name: "บี" })?.score, 20);
     assert.equal(users.find({ score: { $gte: 15 } }).count(), 1);
