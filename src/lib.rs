@@ -1641,10 +1641,10 @@ mod tests {
         let path = temp_xdb("add");
         let db = XDB::open(&path).unwrap();
 
-        assert_eq!(db.add("views", 1).unwrap(), 1.0);       // เริ่มที่ 0 → 1
-        assert_eq!(db.add("views", 1).unwrap(), 2.0);
-        assert_eq!(db.add("views", 10).unwrap(), 12.0);
-        assert_eq!(db.add("views", -2).unwrap(), 10.0);      // ติดลบ = ลด
+        assert_eq!(db.add("views", 1.0).unwrap(), 1.0);       // เริ่มที่ 0 → 1
+        assert_eq!(db.add("views", 1.0).unwrap(), 2.0);
+        assert_eq!(db.add("views", 10.0).unwrap(), 12.0);
+        assert_eq!(db.add("views", -2.0).unwrap(), 10.0);      // ติดลบ = ลด
         assert_eq!(db.add("price", 1.5).unwrap(), 1.5);      // ทศนิยมได้
         assert_eq!(db.add("price", 0.5).unwrap(), 2.0);
         assert_eq!(db.get_utf8("views").unwrap(), Some("10".to_string()));
@@ -1658,7 +1658,7 @@ mod tests {
 
         // เปิดใหม่ — เลขยังอยู่ บวกต่อได้
         let db2 = XDB::open(&path).unwrap();
-        assert_eq!(db2.add("views", 5).unwrap(), 15.0);
+        assert_eq!(db2.add("views", 5.0).unwrap(), 15.0);
         db2.close().unwrap();
     }
 
