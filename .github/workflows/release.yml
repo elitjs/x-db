@@ -1,6 +1,5 @@
-# Release pipeline: build .node ทุก platform แล้ว publish ขึ้น npm
-# ใช้เมื่อ: push git tag (เช่น `git push origin v0.3.0`)
-# ต้องตั้ง secret NPM_TOKEN ใน repo settings ก่อน
+# Release pipeline: build .node ทุก platform → publish platform packages → publish main package
+# npm จะโหลดเฉพาะ .node ของ OS ที่ตรงกับเครื่องผู้ใช้ผ่าน optionalDependencies
 name: Release x-db
 
 on:
@@ -21,12 +20,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            npm_platform: linux-x64-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            npm_platform: win32-x64-msvc
           - os: macos-latest
             target: x86_64-apple-darwin
+            npm_platform: darwin-x64
           - os: macos-latest
             target: aarch64-apple-darwin
+            npm_platform: darwin-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +43,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
         run: cd typescript && npm install
@@ -52,8 +56,41 @@ jobs:
         working-directory: typescript
         run: npm run build
 
+      # ── สร้าง platform package (เช่น @elitjs/xdb-win32-x64-msvc) ──
+      - name: Prepare platform package
+        shell: bash
+        run: |
+          NODE_FILE=$(ls typescript/*.node | head -1)
+          echo "Found: $NODE_FILE"
 
-      - name: Upload artifact
+          mkdir -p platform-pkg
+          cp "$NODE_FILE" platform-pkg/
+
+          OS_NAME="linux"
+          if [[ "${{ matrix.npm_platform }}" == win32* ]]; then OS_NAME="win32"; fi
+          if [[ "${{ matrix.npm_platform }}" == darwin* ]]; then OS_NAME="darwin"; fi
+
+          CPU_NAME="x64"
+          if [[ "${{ matrix.npm_platform }}" == *arm64 ]]; then CPU_NAME="arm64"; fi
+
+          cat > platform-pkg/package.json << EOF
+          {
+            "name": "@elitjs/xdb-${{ matrix.npm_platform }}",
+            "version": "${{ github.ref_name }}",
+            "os": ["$OS_NAME"],
+            "cpu": ["$CPU_NAME"],
+            "description": "x-db native addon for ${{ matrix.npm_platform }}",
+            "license": "MIT"
+          }
+          EOF
+
+      - name: Publish platform package
+        working-directory: platform-pkg
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Upload artifact (for main package)
         uses: actions/upload-artifact@v4
         with:
           name: xdb-${{ matrix.target }}
@@ -63,8 +100,8 @@ jobs:
             typescript/xdb.d.ts
             typescript/dist/
 
-  publish:
-    name: Publish to npm
+  publish-main:
+    name: Publish main package
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -80,19 +117,24 @@ jobs:
         with:
           path: artifacts
 
-      - name: Assemble package
+      - name: Assemble main package
         run: |
           mkdir -p typescript/dist
           FIRST=$(ls artifacts/ | head -1)
           cp artifacts/$FIRST/xdb.cjs typescript/
           cp artifacts/$FIRST/xdb.d.ts typescript/
           cp -r artifacts/$FIRST/dist/* typescript/dist/
-          for d in artifacts/*/; do cp $d*.node typescript/ 2>/dev/null || true; done
+          cp README.md typescript/
           ls -la typescript/
 
-      - name: Publish
+      - name: Publish main package
         working-directory: typescript
-        run: npm publish --access public
+        run: |
+          npm pkg set optionalDependencies["@elitjs/xdb-win32-x64-msvc"]="${{ github.ref_name }}"
+          npm pkg set optionalDependencies["@elitjs/xdb-linux-x64-gnu"]="${{ github.ref_name }}"
+          npm pkg set optionalDependencies["@elitjs/xdb-darwin-x64"]="${{ github.ref_name }}"
+          npm pkg set optionalDependencies["@elitjs/xdb-darwin-arm64"]="${{ github.ref_name }}"
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -100,5 +142,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            typescript/*.node
