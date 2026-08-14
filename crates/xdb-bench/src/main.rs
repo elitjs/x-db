@@ -386,7 +386,7 @@ fn oltp_main() -> Result<(), Box<dyn Error>> {
 fn oltp_xdb(dir: &Path, sync: bool, label: &str) -> Result<OltpRow, Box<dyn Error>> {
     use x_db::store::{StoreOptions, XDBStore};
     let d = dir.join(if sync { "xdb_sync" } else { "xdb_nosync" });
-    let store = XDBStore::open_opts(&d, StoreOptions { compact_threshold: 8, flush_entries: 4096, sync })?;
+    let store = XDBStore::open_opts(&d, StoreOptions { compact_threshold: 8, flush_entries: 4096, sync, sync_interval_ms: 0 })?;
 
     // preload base keys (batch)
     let base: Vec<(Vec<u8>, Vec<u8>)> = (0..OP_N).map(|i| (base_key(i), op_val(i))).collect();
