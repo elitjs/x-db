@@ -5,12 +5,33 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "xdb-native.cjs",
+    "xdb-native.d.ts"
+  ],
   "scripts": {
     "native:build": "napi build --platform --release --cargo-cwd ../crates/xdb-node --js xdb-native.cjs --dts xdb-native.d.ts .",
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/native.test.js",
     "example": "npm run build && node dist/example.js"
   },
+  "napi": {
+    "binaryName": "xdb-native",
+    "targets": [
+      "x86_64-pc-windows-msvc",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/d-osc/x-db"
+  },
+  "license": "MIT",
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",
     "typescript": "^5.6.0",

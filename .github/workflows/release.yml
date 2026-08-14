@@ -1,0 +1,17 @@
+# Release pipeline: build .node ทุก platform แล้ว publish ขึ้น npm
+# ใช้เมื่อ: push git tag (เช่น `git tag v0.1.0 && git push --tags`)
+# ต้องตั้ง secret NPM_TOKEN ใน repo settings ก่อน (npm access token แบบ Automation)
+name: Release xdb-native
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    uses: napi-rs/napi-rs/.github/workflows/release.yaml@main
+    with:
+      build-command: "npm run native:build"
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

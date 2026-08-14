@@ -1,5 +1,19 @@
-dist
-node_modules
-target
+# Rust
+/target
 
-*.node
+# Node
+/typescript/node_modules
+/typescript/dist
+/typescript/*.node
+/typescript/xdb-native.cjs
+/typescript/xdb-native.d.ts
+/typescript/.npmrc
+
+# ข้อมูลระหว่างพัฒนา
+/data
+*.xdb
+*.xdb.tmp
+
+# OS/editor
+.DS_Store
+Thumbs.db

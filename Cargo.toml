@@ -2,6 +2,11 @@
 name = "x-db"
 version = "0.1.0"
 edition = "2021"
+description = "Read-optimized embedded key-value store (SSTable-style): bloom filter + mmap + CRC, with a realtime layered store (LSM-lite)"
+license = "MIT"
+repository = "https://github.com/d-osc/x-db"
+keywords = ["database", "key-value", "embedded", "mmap", "sst"]
+categories = ["database", "data-structures"]
 
 [workspace]
 members = ["crates/xdb-node", "crates/xdb-bench"]
