@@ -1,5 +1,3 @@
-export { Collection, FindCursor } from "./mongo.js";
-export type { MongoDoc, Filter, UpdateSpec, SortSpec, FieldOps } from "./mongo.js";
 
 /**
  * x-db native binding สำหรับ TypeScript/Node.js
@@ -721,12 +719,6 @@ export class XDB {
     this.#sf.exportAndClose();
   }
 
-  /** เข้าถึง collection สไตล์ MongoDB (insertOne/find/updateOne/...) — เกิดเองตอน insert แรก */
-  collection<T extends import("./mongo.js").MongoDoc = import("./mongo.js").MongoDoc>(
-    name: string,
-  ): import("./mongo.js").Collection<T> {
-    return createCollection<T>(this, name);
-  }
 }
 
 function* mapEntries(
@@ -736,13 +728,4 @@ function* mapEntries(
   for (const e of it) {
     yield { key: e.key, value: decode(e.value) };
   }
-}
-
-/** สร้าง Collection (แยกไว้กัน circular import ระหว่าง index ↔ mongo) */
-function createCollection<T extends import("./mongo.js").MongoDoc>(
-  db: XDB,
-  name: string,
-): import("./mongo.js").Collection<T> {
-  const { Collection } = require("./mongo.js") as typeof import("./mongo.js");
-  return new Collection<T>(db, name);
 }
