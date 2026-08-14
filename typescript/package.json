@@ -1,6 +1,6 @@
 {
   "name": "@elitjs/xdb",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Native Node.js addon (napi-rs) สำหรับเรียกใช้ x-db จาก TypeScript โดยตรง",
   "type": "module",
   "main": "dist/index.js",
