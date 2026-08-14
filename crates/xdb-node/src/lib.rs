@@ -202,12 +202,23 @@ use std::sync::Arc as StdArc;
 use x_db::XDBStore as InnerStore;
 
 /// Store แบบ layered สำหรับแอปที่ update แบบ realtime
-/// put/delete = เขียน layer เล็กใหม่ (เร็ว) / get = ข้าม layers ตัวใหม่ชนะ
+/// put/delete = เขียน WAL + memtable (เร็วมาก) / get = memtable → layers ตัวใหม่ชนะ
 /// compact อัตโนมัติเมื่อ layers ถึง threshold (default 8)
 #[napi]
 pub struct XdbStore {
   /// None = ถูกปิดด้วย close() แล้ว (ปลดล็อก directory ให้คนอื่นเปิดได้)
   inner: Option<StdArc<InnerStore>>,
+}
+
+/// ตัวเลือกการเปิด XdbStore
+#[napi(object)]
+pub struct StoreOptions {
+  /// จำนวน layers ที่ trigger compact อัตโนมัติ (default 8, 0 = ปิด)
+  pub compact_threshold: Option<u32>,
+  /// จำนวน entries ใน memtable ที่ trigger flush เป็น layer (default 4096, 0 = flush เองเท่านั้น)
+  pub flush_entries: Option<u32>,
+  /// fsync WAL ทุก put (default true) — false = เร็วขึ้นแต่พังกลางทางอาจเสีย put ล่าสุด
+  pub sync: Option<bool>,
 }
 
 fn closed_err() -> Error {
@@ -217,11 +228,16 @@ fn closed_err() -> Error {
 #[napi]
 impl XdbStore {
   /// เปิด store ที่ directory นั้น (สร้างให้ถ้ายังไม่มี)
-  /// `compactThreshold` = จำนวน layers ที่ trigger compact อัตโนมัติ (default 8, 0 = ปิด)
   #[napi(constructor)]
-  pub fn new(path: String, compact_threshold: Option<u32>) -> Result<Self> {
-    let threshold = compact_threshold.unwrap_or(x_db::store::DEFAULT_COMPACT_THRESHOLD as u32) as usize;
-    InnerStore::open_with(&path, threshold)
+  pub fn new(path: String, options: Option<StoreOptions>) -> Result<Self> {
+    let opts = options.map(|o| {
+      let mut s = x_db::store::StoreOptions::default();
+      if let Some(t) = o.compact_threshold { s.compact_threshold = t as usize; }
+      if let Some(f) = o.flush_entries { s.flush_entries = f as usize; }
+      if let Some(sync) = o.sync { s.sync = sync; }
+      s
+    }).unwrap_or_default();
+    InnerStore::open_opts(&path, opts)
       .map_err(io_err)
       .map(|inner| Self { inner: Some(StdArc::new(inner)) })
   }
@@ -241,6 +257,18 @@ impl XdbStore {
   #[napi(getter)]
   pub fn layer_count(&self) -> Result<u32> {
     Ok(self.inner()?.layer_count() as u32)
+  }
+
+  /// จำนวน entries ใน memtable ที่ยังไม่ได้ flush เป็น layer
+  #[napi(getter)]
+  pub fn memtable_len(&self) -> Result<u32> {
+    Ok(self.inner()?.memtable_len().min(u32::MAX as usize) as u32)
+  }
+
+  /// ดัน memtable ลง layer ถาวร + ล้าง WAL (ปกติ auto ตาม flushEntries อยู่แล้ว)
+  #[napi]
+  pub fn flush(&self) -> Result<()> {
+    self.inner()?.flush().map_err(io_err)
   }
 
   /// เพิ่ม/แก้ค่า (upsert) — รับได้ทั้ง string และ Buffer, ไม่เรียงก็ได้, key ซ้ำตัวหลังชนะ

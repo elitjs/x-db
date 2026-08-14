@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub mod store;
+pub mod wal;
 pub use store::XDBStore;
 
 pub const MAGIC_HEADER: u32 = 0x58444231; // "XDB1"
@@ -1331,9 +1332,10 @@ mod tests {
             store.put(&[(b"a", b"2")]).unwrap();
             store.delete(&[b"zz"]).unwrap();
             store.put(&[(b"b", b"3")]).unwrap();
-            assert_eq!(store.layer_count(), 4);
+            assert_eq!(store.layer_count(), 0); // ทั้งหมดอยู่ใน memtable (ยังไม่ flush)
+            assert_eq!(store.memtable_len(), 3);
 
-            assert_eq!(store.compact().unwrap(), 1);
+            assert_eq!(store.compact().unwrap(), 1); // compact ดัน memtable ลง layer ให้
             assert_eq!(store.layer_count(), 1);
             assert_eq!(store.get(b"a").unwrap(), Some(b"2".to_vec()));
             assert_eq!(store.get(b"zz").unwrap(), None); // tombstone ต้องยังกดอยู่
@@ -1354,7 +1356,9 @@ mod tests {
             store.put(&[(b"k2", b"v2")]).unwrap();
         }
         let store = XDBStore::open(&dir).unwrap();
-        assert_eq!(store.layer_count(), 2);
+        // ข้อมูลถูก replay จาก WAL เข้า memtable (ไม่สูญหายแม้ไม่ได้ flush)
+        assert_eq!(store.memtable_len(), 2);
+        assert_eq!(store.layer_count(), 0);
         assert_eq!(store.get(b"k1").unwrap(), Some(b"v1".to_vec()));
         assert_eq!(store.get(b"k2").unwrap(), Some(b"v2".to_vec()));
     }
@@ -1362,7 +1366,12 @@ mod tests {
     #[test]
     fn store_auto_compact_at_threshold() {
         let dir = temp_store("auto");
-        let store = XDBStore::open_with(&dir, 4).unwrap();
+        let opts = crate::store::StoreOptions {
+            compact_threshold: 4,
+            flush_entries: 1, // ทุก put flush เป็น layer ทันที (เพื่อทดสอบ threshold)
+            sync: true,
+        };
+        let store = XDBStore::open_opts(&dir, opts).unwrap();
         for i in 0..3 {
             store.put(&[(format!("k{i}").as_bytes(), b"v")]).unwrap();
         }
@@ -1484,6 +1493,118 @@ mod tests {
         drop(store); // ปลดล็อก
         let reopened = XDBStore::open(&dir); // ต้องเปิดได้
         assert!(reopened.is_ok());
+    }
+
+    // ---- WAL + memtable ----
+
+    #[test]
+    fn store_wal_replay_recovers_unflushed_puts() {
+        let dir = temp_store("wal_replay");
+        {
+            let store = XDBStore::open(&dir).unwrap();
+            store.put(&[(b"a", b"1"), (b"b", b"2")]).unwrap();
+            store.put(&[(b"c", b"3")]).unwrap();
+            store.delete(&[b"b"]).unwrap();
+            // ไม่ flush — ทุกอย่างอยู่ใน memtable + WAL
+        }
+        // เปิดใหม่: WAL replay ต้องคืนทุกอย่างรวมที่เพิ่งลบ
+        let store = XDBStore::open(&dir).unwrap();
+        assert_eq!(store.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(store.get(b"b").unwrap(), None); // ถูกลบ — tombstone ใน WAL ด้วย
+        assert_eq!(store.get(b"c").unwrap(), Some(b"3".to_vec()));
+        assert_eq!(store.memtable_len(), 3);
+    }
+
+    #[test]
+    fn store_flush_creates_layer_and_clears_wal() {
+        let dir = temp_store("flush");
+        {
+            let store = XDBStore::open(&dir).unwrap();
+            store.put(&[(b"a", b"1"), (b"b", b"2")]).unwrap();
+            assert_eq!(store.memtable_len(), 2);
+            store.flush().unwrap();
+            assert_eq!(store.memtable_len(), 0); // memtable ว่างแล้ว
+            assert_eq!(store.layer_count(), 1); // ข้อมูลอยู่ใน layer
+            assert_eq!(store.get(b"a").unwrap(), Some(b"1".to_vec()));
+        }
+        // เปิดใหม่ — ข้อมูลมาจาก layer (WAL ถูกล้างแล้ว)
+        let store = XDBStore::open(&dir).unwrap();
+        assert_eq!(store.memtable_len(), 0);
+        assert_eq!(store.layer_count(), 1);
+        assert_eq!(store.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(store.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn store_auto_flush_at_threshold() {
+        let dir = temp_store("autoflush");
+        let opts = crate::store::StoreOptions {
+            compact_threshold: 0,
+            flush_entries: 5,
+            sync: true,
+        };
+        let store = XDBStore::open_opts(&dir, opts).unwrap();
+        for i in 0..4 {
+            store.put(&[(format!("k{i}").as_bytes(), b"v")]).unwrap();
+        }
+        assert_eq!(store.memtable_len(), 4);
+        assert_eq!(store.layer_count(), 0);
+        store.put(&[(b"k4", b"v")]).unwrap(); // ตัวที่ 5 → flush อัตโนมัติ
+        assert_eq!(store.memtable_len(), 0);
+        assert_eq!(store.layer_count(), 1);
+        // ข้อมูลครบ
+        for i in 0..5 {
+            assert!(store.get(format!("k{i}").as_bytes()).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn store_iter_includes_memtable() {
+        let dir = temp_store("iter_mem");
+        let store = XDBStore::open(&dir).unwrap();
+        store.put(&[(b"a", b"1"), (b"c", b"3")]).unwrap();
+        store.flush().unwrap(); // ลง layer
+        store.put(&[(b"b", b"2"), (b"a", b"1-new")]).unwrap(); // อยู่ใน memtable
+        store.delete(&[b"c"]).unwrap(); // ลบใน memtable
+
+        let view: Vec<(Vec<u8>, Vec<u8>)> = store.iter().map(|r| r.unwrap()).collect();
+        assert_eq!(
+            view,
+            vec![(b"a".to_vec(), b"1-new".to_vec()), (b"b".to_vec(), b"2".to_vec())]
+        ); // a เอาค่า memtable, c ถูกลบ
+    }
+
+    #[test]
+    fn store_wal_survives_garbage_tail() {
+        let dir = temp_store("wal_torn");
+        {
+            let store = XDBStore::open(&dir).unwrap();
+            store.put(&[(b"a", b"1")]).unwrap();
+        }
+        // จำลอง crash กลาง write: ผนวกขยะครึ่ง ๆ กลาง ๆ เข้าไปท้าย WAL
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(dir.join("wal.log")).unwrap();
+        f.write_all(&[0x00, 0xAB, 0xCD]).unwrap();
+        drop(f);
+
+        let store = XDBStore::open(&dir).unwrap();
+        // ข้อมูลก่อนหน้าต้องอยู่ครบ ส่วนขยะถูกตัดทิ้ง
+        assert_eq!(store.get(b"a").unwrap(), Some(b"1".to_vec()));
+        // และเขียนต่อได้ปกติ
+        store.put(&[(b"b", b"2")]).unwrap();
+        assert_eq!(store.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn store_sync_false_still_durable_on_clean_close() {
+        let dir = temp_store("nosync");
+        {
+            let opts = crate::store::StoreOptions { sync: false, ..Default::default() };
+            let store = XDBStore::open_opts(&dir, opts).unwrap();
+            store.put(&[(b"fast", b"1")]).unwrap();
+        }
+        let store = XDBStore::open(&dir).unwrap();
+        assert_eq!(store.get(b"fast").unwrap(), Some(b"1".to_vec()));
     }
 
     // ---- compression (format v6) ----

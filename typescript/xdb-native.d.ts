@@ -21,6 +21,15 @@ export declare function writeTable(path: string, entries: Array<Entry>): void
  * คзนจำนวน entries ในตารางผลลбพธт
  */
 export declare function mergeTables(inputs: Array<string>, output: string): number
+/** ตбวเลзอกการเปдด XdbStore */
+export interface StoreOptions {
+  /** จำนวน layers ทеш trigger compact อбตโนมбตд (default 8, 0 = ปдด) */
+  compactThreshold?: number
+  /** จำนวน entries ใน memtable ทеш trigger flush เปчน layer (default 4096, 0 = flush เองเทшานбщน) */
+  flushEntries?: number
+  /** fsync WAL ทиก put (default true) — false = เรчวขжщนแตшพбงกลางทางอาจเสеย put ลшาสиด */
+  sync?: boolean
+}
 /** entry จาก store iterator (ตбด tombstone ออกแลщว) */
 export interface StoreEntry {
   key: Buffer
@@ -57,15 +66,12 @@ export declare class XdbIterator {
 }
 /**
  * Store แบบ layered สำหรбบแอปทеш update แบบ realtime
- * put/delete = เขеยน layer เลчกใหมш (เรчว) / get = ขщาม layers ตбวใหมшชนะ
+ * put/delete = เขеยน WAL + memtable (เรчวมาก) / get = memtable → layers ตбวใหมшชนะ
  * compact อбตโนมбตдเมзшอ layers ถжง threshold (default 8)
  */
 export declare class XdbStore {
-  /**
-   * เปдด store ทеш directory นбщน (สรщางใหщถщายбงไมшมе)
-   * `compactThreshold` = จำนวน layers ทеш trigger compact อбตโนมбตд (default 8, 0 = ปдด)
-   */
-  constructor(path: string, compactThreshold?: number | undefined | null)
+  /** เปдด store ทеш directory นбщน (สรщางใหщถщายбงไมшมе) */
+  constructor(path: string, options?: StoreOptions | undefined | null)
   /**
    * ปдด store + ปลด lock ของ directory — เรеยกเมзшอใชщงานเสรчจ
    * (ไมшเรеยกกчไดщ จะปลดเองตอน GC แตшจะถзอ lock ไวщนานกวшา)
@@ -73,6 +79,10 @@ export declare class XdbStore {
   close(): void
   /** จำนวน layers ปбจจиบбน */
   get layerCount(): number
+  /** จำนวน entries ใน memtable ทешยбงไมшไดщ flush เปчน layer */
+  get memtableLen(): number
+  /** ดбน memtable ลง layer ถาวร + ลщาง WAL (ปกตд auto ตาม flushEntries อยйшแลщว) */
+  flush(): void
   /** เพдшม/แกщคшา (upsert) — รбบไดщทбщง string และ Buffer, ไมшเรеยงกчไดщ, key ซщำตбวหลбงชนะ */
   put(entries: Array<Entry>): void
   /** ลบ keys — เขеยน tombstone กดคшาใน layer เกшา */

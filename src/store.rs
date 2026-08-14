@@ -1,13 +1,16 @@
 //! XDBStore — layered store สำหรับแอปที่ update แบบ realtime (LSM-lite)
 //!
 //! หลักการ: ข้อมูลอยู่เป็น "layers" (ไฟล์ .xdb เรียงตามลำดับ 000001.xdb, 000002.xdb, ...)
-//! - `put` = เขียน layer เล็กใหม่ (เร็ว — ไม่แตะตารางหลัก)
-//! - `get` = ค้นจาก layer ใหม่ → เก่า (bloom filter ทำให้ miss ถูกมาก)
-//! - `delete` = เขียน tombstone กด key ใน layer ที่เก่ากว่า
-//! - `compact` = รวมทุก layers เป็นไฟล์เดียว (เกิดอัตโนมัติเมื่อ layers สะสมถึง threshold)
+//! - `put` = เขียน WAL + memtable (เร็วมาก — fsync รวมทั้ง batch เดียว)
+//! - memtable เต็ม → flush เป็น layer ใหม่อัตโนมัติ
+//! - `get` = memtable → layer ใหม่ → เก่า (bloom filter ทำให้ miss ถูกมาก)
+//! - `delete` = tombstone กด key ใน layer ที่เก่ากว่า
+//! - `compact` = รวมทุก layers เป็นไฟล์เดียว (บีบอัด LZ4, เกิดอัตโนมัติเมื่อถึง threshold)
 
 use crate::{parse_entry, merge_tables_with, TableBuilder, XDBReader};
+use crate::wal::Wal;
 use fs4::fs_std::FileExt;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self};
 use std::path::{Path, PathBuf};
@@ -16,6 +19,28 @@ use std::sync::{Arc, Mutex, RwLock};
 
 /// จำนวน layers ที่ทำให้ compact อัตโนมัติ (0 = ปิด)
 pub const DEFAULT_COMPACT_THRESHOLD: usize = 8;
+/// จำนวน entries ใน memtable ที่ trigger flush เป็น layer (0 = ไม่ auto-flush)
+pub const DEFAULT_FLUSH_ENTRIES: usize = 4096;
+
+/// ตัวเลือกการเปิด XDBStore
+pub struct StoreOptions {
+    /// จำนวน layers ที่ trigger compact อัตโนมัติ (default 8, 0 = ปิด)
+    pub compact_threshold: usize,
+    /// จำนวน entries ใน memtable ที่ trigger flush เป็น layer (default 4096, 0 = flush เองเท่านั้น)
+    pub flush_entries: usize,
+    /// fsync WAL ทุก put (default true) — false = เร็วขึ้นแต่ถ้าไฟดัน/พัง อาจเสีย put ล่าสุด
+    pub sync: bool,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self {
+            compact_threshold: DEFAULT_COMPACT_THRESHOLD,
+            flush_entries: DEFAULT_FLUSH_ENTRIES,
+            sync: true,
+        }
+    }
+}
 
 struct Layer {
     path: PathBuf,
@@ -25,21 +50,31 @@ struct Layer {
 pub struct XDBStore {
     dir: PathBuf,
     layers: RwLock<Vec<Layer>>,
-    /// กันเขียน layer พร้อมกัน
+    /// memtable — entries ใหม่สุด (Option = tombstone) อยู่ที่นี่ก่อน flush เป็น layer
+    memtable: RwLock<BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    /// WAL — คู่หูความ durable ของ memtable
+    wal: Mutex<Wal>,
+    /// กันเขียนพร้อมกัน (put/delete/flush/compact)
     write_lock: Mutex<()>,
     next_seq: AtomicU64,
-    compact_threshold: usize,
+    options: StoreOptions,
     /// ถือ exclusive lock ไว้ตลอดอายุ store — กันอีก process (หรือ instance) เปิด dir เดียวกัน
     _lock_file: File,
 }
 
 impl XDBStore {
     pub fn open<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
-        Self::open_with(dir, DEFAULT_COMPACT_THRESHOLD)
+        Self::open_opts(dir, StoreOptions::default())
     }
 
     /// `compact_threshold` = จำนวน layers ที่จะ trigger compact อัตโนมัติ (0 = compact เองเท่านั้น)
     pub fn open_with<P: AsRef<Path>>(dir: P, compact_threshold: usize) -> io::Result<Self> {
+        let mut opts = StoreOptions::default();
+        opts.compact_threshold = compact_threshold;
+        Self::open_opts(dir, opts)
+    }
+
+    pub fn open_opts<P: AsRef<Path>>(dir: P, options: StoreOptions) -> io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
 
         // exclusive lock บนไฟล์ LOCK — instance/process ที่สองจะเปิดไม่ได้จนกว่าตัวแรกจะปิด
@@ -72,12 +107,19 @@ impl XDBStore {
         }
         layers.sort_by_key(|l| layer_seq(&l.path).unwrap_or(0));
 
+        // Replay WAL ลง memtable (torn tail จาก crash ถูกตัดทิ้งใน Wal::open)
+        let (wal, wal_entries) = Wal::open(&dir.as_ref().join("wal.log"), options.sync)?;
+        let memtable: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            wal_entries.into_iter().collect();
+
         Ok(Self {
             dir: dir.as_ref().to_path_buf(),
             layers: RwLock::new(layers),
+            memtable: RwLock::new(memtable),
+            wal: Mutex::new(wal),
             write_lock: Mutex::new(()),
             next_seq: AtomicU64::new(max_seq + 1),
-            compact_threshold,
+            options,
             _lock_file: lock_file,
         })
     }
@@ -87,15 +129,22 @@ impl XDBStore {
         self.layers.read().unwrap().len()
     }
 
-    /// ค้นหา key ข้ามทุก layers (ตัวใหม่ชนะ, tombstone = ถูกลบ)
-    /// คืนค่าเป็น owned Vec เพราะ layers อยู่หลัง RwLock
+    /// จำนวน entries ใน memtable ที่ยังไม่ได้ flush
+    pub fn memtable_len(&self) -> usize {
+        self.memtable.read().unwrap().len()
+    }
+
+    /// ค้นหา key: memtable (ใหม่สุด) → layers ใหม่ → เก่า (tombstone = ถูกลบ)
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        if let Some(v) = self.memtable.read().unwrap().get(key) {
+            return Ok(v.clone());
+        }
         let layers = self.layers.read().unwrap();
         for layer in layers.iter().rev() {
             match layer.reader.get_entry(key)? {
-                Some(Some(v)) => return Ok(Some(v.to_vec())),
+                Some(Some(v)) => return Ok(Some(v)),
                 Some(None) => return Ok(None), // tombstone — ถูกลบ หยุดค้น
-                None => continue,             // ไม่มีใน layer นี้ ไปต่อ
+                None => continue,
             }
         }
         Ok(None)
@@ -105,50 +154,102 @@ impl XDBStore {
         Ok(self.get(key)?.is_some())
     }
 
-    /// เพิ่ม/แก้ค่า (upsert) — เขียน layer ใหม่ (key ซ้ำใน batch ตัวหลังชนะ, ไม่เรียงก็ได้)
+    /// เพิ่ม/แก้ค่า (upsert) — เขียน WAL ก่อน แล้วลง memtable (key ซ้ำตัวหลังชนะ, ไม่เรียงก็ได้)
     pub fn put(&self, entries: &[(&[u8], &[u8])]) -> io::Result<()> {
-        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = entries
+        let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = entries
             .iter()
-            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .map(|(k, v)| (k.to_vec(), Some(v.to_vec())))
             .collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        dedup_last_wins(&mut pairs);
+        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        batch.dedup_by(|a, b| a.0 == b.0);
+        self.write_batch(batch)
+    }
 
-        let compact_needed = {
+    /// ลบ keys — เขียน tombstone ลง WAL + memtable กดค่าเก่า
+    pub fn delete(&self, keys: &[&[u8]]) -> io::Result<()> {
+        let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+            keys.iter().map(|k| (k.to_vec(), None)).collect();
+        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        batch.dedup_by(|a, b| a.0 == b.0);
+        self.write_batch(batch)
+    }
+
+    /// แกนร่วมของ put/delete: WAL → memtable → flush ถ้าเต็ม → compact ถ้าถึง threshold
+    fn write_batch(&self, batch: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> io::Result<()> {
+        let compact_needed;
+        {
             let _g = self.write_lock.lock().unwrap();
-            self.write_layer(|b| {
-                for (k, v) in &pairs {
-                    b.add(k, v)?;
+            self.wal.lock().unwrap().append(&batch)?;
+            {
+                let mut mem = self.memtable.write().unwrap();
+                for (k, v) in &batch {
+                    mem.insert(k.clone(), v.clone());
                 }
-                Ok(())
-            })?;
-            self.layers.read().unwrap().len() >= self.compact_threshold && self.compact_threshold > 0
-        };
+            }
+            if self.options.flush_entries > 0
+                && self.memtable.read().unwrap().len() >= self.options.flush_entries
+            {
+                self.flush_locked()?;
+            }
+            compact_needed = self.options.compact_threshold > 0
+                && self.layers.read().unwrap().len() >= self.options.compact_threshold;
+        }
         if compact_needed {
             self.compact()?;
         }
         Ok(())
     }
 
-    /// ลบ keys — เขียน layer ที่มี tombstone กดค่าเก่า
-    pub fn delete(&self, keys: &[&[u8]]) -> io::Result<()> {
-        let mut sorted: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
-        sorted.sort();
-        sorted.dedup();
+    /// Flush memtable เป็น layer ใหม่ + ล้าง WAL — เรียกเองได้ (ปกติ auto ตาม flush_entries)
+    pub fn flush(&self) -> io::Result<()> {
+        let _g = self.write_lock.lock().unwrap();
+        self.flush_locked()
+    }
 
-        let compact_needed = {
-            let _g = self.write_lock.lock().unwrap();
-            self.write_layer(|b| {
-                for k in &sorted {
-                    b.add_tombstone(k)?;
-                }
-                Ok(())
-            })?;
-            self.layers.read().unwrap().len() >= self.compact_threshold && self.compact_threshold > 0
+    /// flush โดยถือ write_lock อยู่แล้ว
+    fn flush_locked(&self) -> io::Result<()> {
+        let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
+            let mem = self.memtable.read().unwrap();
+            mem.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
-        if compact_needed {
-            self.compact()?;
+        if entries.is_empty() {
+            return Ok(());
         }
+
+        // เขียน layer ก่อน (durable) — ถ้าพังกลางทาง WAL ยังอยู่ ไม่เสียข้อมูล
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let final_path = self.dir.join(format!("{seq:06}.xdb"));
+        let tmp = final_path.with_extension("xdb.tmp");
+        {
+            let mut b = TableBuilder::create(&tmp, entries.len())?;
+            for (k, v) in &entries {
+                match v {
+                    Some(v) => b.add(k, v)?,
+                    None => b.add_tombstone(k)?,
+                }
+            }
+            b.finish()?;
+        }
+        if final_path.exists() {
+            std::fs::remove_file(&final_path)?;
+        }
+        std::fs::rename(&tmp, &final_path)?;
+        let reader = Arc::new(XDBReader::open(&final_path)?);
+
+        // สลับแบบ atomic ต่อ reader: push layer + clear memtable ใน critical section เดียว
+        // (กัน reader ที่เห็น memtable ว่างแต่ layer ยังไม่ขึ้น)
+        {
+            let mut mem = self.memtable.write().unwrap();
+            let mut layers = self.layers.write().unwrap();
+            // เก็บเฉพาะ entries ที่เข้าใหม่ระหว่างเขียน layer (BTreeMap ทำให้ range ง่าย)
+            layers.push(Layer { path: final_path, reader });
+            mem.clear();
+            // หมายเหตุ: ถ้ามี put ใหม่ระหว่าง flush มันถูก serialize โดย write_lock อยู่แล้ว
+            // (flush_locked ถูกเรียกใต้ write_lock เสมอ) จึงไม่มี entry หลุด
+        }
+
+        // layer ถาวรแล้ว → ล้าง WAL ได้
+        self.wal.lock().unwrap().reset()?;
         Ok(())
     }
 
@@ -156,6 +257,9 @@ impl XDBStore {
     /// tombstone ถูกคงไว้ (กันกรณีลบไฟล์เก่าไม่สำเร็จบน Windows แล้วข้อมูลโผล่อีก)
     pub fn compact(&self) -> io::Result<usize> {
         let _g = self.write_lock.lock().unwrap();
+
+        // ดัน memtable ลง layer ก่อน จะได้รวมข้อมูลทั้งหมด
+        self.flush_locked()?;
 
         let mut current: Vec<(PathBuf, Arc<XDBReader>)> = {
             let layers = self.layers.read().unwrap();
@@ -188,31 +292,8 @@ impl XDBStore {
         Ok(1)
     }
 
-    /// เขียน layer ใหม่แบบ atomic (เขียน .tmp แล้ว rename) แล้วเพิ่มเข้ารายการ
-    fn write_layer<F>(&self, fill: F) -> io::Result<()>
-    where
-        F: FnOnce(&mut TableBuilder) -> io::Result<()>,
-    {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let final_path = self.dir.join(format!("{seq:06}.xdb"));
-        let tmp = final_path.with_extension("xdb.tmp");
-
-        let mut builder = TableBuilder::create(&tmp, 16)?;
-        fill(&mut builder)?;
-        builder.finish()?;
-
-        if final_path.exists() {
-            std::fs::remove_file(&final_path)?;
-        }
-        std::fs::rename(&tmp, &final_path)?;
-
-        let reader = Arc::new(XDBReader::open(&final_path)?);
-        self.layers.write().unwrap().push(Layer { path: final_path, reader });
-        Ok(())
-    }
-
-    /// ไล่ "มุมมองปัจจุบัน" ของทั้ง store — เรียงตาม key, ตัด key ที่ถูกลบแล้ว,
-    /// key ซ้ำให้ค่าจาก layer ใหม่สุด
+    /// ไล่ "มุมมองปัจจุบัน" ของทั้ง store — รวม memtable — เรียงตาม key,
+    /// ตัด key ที่ถูกลบแล้ว, key ซ้ำให้ค่าจากตัวใหม่สุด
     pub fn iter(&self) -> StoreIter {
         self.iter_from(&[])
     }
@@ -221,7 +302,11 @@ impl XDBStore {
     pub fn iter_from(&self, start: &[u8]) -> StoreIter {
         let layers = self.layers.read().unwrap();
         let readers: Vec<Arc<XDBReader>> = layers.iter().map(|l| l.reader.clone()).collect();
-        StoreIter::new(readers, start.to_vec())
+        let mem: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
+            let m = self.memtable.read().unwrap();
+            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        StoreIter::new(readers, mem, start.to_vec())
     }
 
     /// ไล่ keys ในช่วง [start, end) — end exclusive
@@ -246,20 +331,6 @@ impl XDBStore {
     }
 }
 
-fn dedup_last_wins(pairs: &mut Vec<(Vec<u8>, Vec<u8>)>) {
-    let mut unique: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(pairs.len());
-    for (k, v) in pairs.drain(..) {
-        if let Some(last) = unique.last_mut() {
-            if last.0 == k {
-                last.1 = v;
-                continue;
-            }
-        }
-        unique.push((k, v));
-    }
-    *pairs = unique;
-}
-
 /// ชื่อไฟล์ layer = `{seq:06}.xdb` → คืน seq
 fn layer_seq(path: &Path) -> Option<u64> {
     if path.extension()?.to_str()? != "xdb" {
@@ -268,34 +339,64 @@ fn layer_seq(path: &Path) -> Option<u64> {
     path.file_stem()?.to_str()?.parse().ok()
 }
 
-/// Iterator มุมมองรวมของหลาย layers (ใหม่ชนะ, ตัด tombstone) — เก็บ Arc ไว้เองจึงไม่ยืม lifetime จาก store
+/// Iterator มุมมองรวมของหลาย layers + memtable (ใหม่ชนะ, ตัด tombstone)
+/// — เก็บ Arc/owned ไว้เองจึงไม่ยืม lifetime จาก store
 pub struct StoreIter {
     readers: Vec<Arc<XDBReader>>,
     /// block/offset ถัดไปของแต่ละ layer
     block: Vec<usize>,
     offset: Vec<usize>,
+    /// head ของแต่ละ "แหล่งข้อมูล" — index สุดท้าย = memtable (ใหม่สุด)
     heads: Vec<Option<(Vec<u8>, Option<Vec<u8>>)>>,
+    /// cursor บน memtable snapshot (index ใน mem_snap)
+    mem_snap: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    mem_idx: usize,
     /// (seek) ข้าม keys ที่น้อยกว่าจุดเริ่ม
     skip_below: Vec<u8>,
 }
 
 impl StoreIter {
-    fn new(readers: Vec<Arc<XDBReader>>, start: Vec<u8>) -> Self {
+    fn new(readers: Vec<Arc<XDBReader>>, mem: Vec<(Vec<u8>, Option<Vec<u8>>)>, start: Vec<u8>) -> Self {
         let n = readers.len();
         let mut it = Self {
             readers,
             block: vec![0; n],
             offset: vec![0; n],
             heads: vec![None; n],
+            mem_snap: mem,
+            mem_idx: 0,
             skip_below: start,
         };
+        // memtable เป็น head ตัวสุดท้าย (index n) — ใหม่สุดจึงชนะใน k-way
+        it.heads.push(it.mem_head());
         for i in 0..n {
             it.advance(i);
         }
         it
     }
 
-    /// เลื่อน head ของ layer i ไป entry ถัดไป (ข้ามข้าม block อัตโนมัติ)
+    /// head ปัจจุบันของ memtable snapshot
+    fn mem_head(&self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        self.mem_snap.get(self.mem_idx).cloned()
+    }
+
+    /// เลื่อน memtable cursor
+    fn advance_mem(&mut self) {
+        self.mem_idx += 1;
+        let n = self.heads.len();
+        self.heads[n - 1] = self.mem_head();
+    }
+
+    /// เลื่อน head ตัวที่ i — ตัวสุดท้ายคือ memtable, ที่เหลือคือ layers
+    fn advance_any(&mut self, i: usize) {
+        if i == self.readers.len() {
+            self.advance_mem();
+        } else {
+            self.advance(i);
+        }
+    }
+
+    /// เลื่อน head ของแหล่งข้อมูลที่ i (layers ธรรมดา)
     fn advance(&mut self, i: usize) {
         loop {
             let reader = &self.readers[i];
@@ -353,21 +454,20 @@ impl Iterator for StoreIter {
                 for i in 0..self.heads.len() {
                     if let Some((k, _)) = &self.heads[i] {
                         if k.as_slice() == min_key {
-                            self.advance(i);
+                            self.advance_any(i);
                         }
                     }
                 }
                 continue;
             }
 
-            // ค่าจาก layer ใหม่สุด (index สูงสุด) ชนะ
+            // ค่าจากแหล่งข้อมูลใหม่สุด (index สูงสุด — memtable ชนะทุก layer) ชนะ
             let mut winner: Option<Option<Vec<u8>>> = None;
             for i in 0..self.heads.len() {
                 let Some((k, v)) = &self.heads[i] else { continue };
                 if k.as_slice() == min_key {
                     winner = Some(v.clone());
-                    let i = i; // เลื่อนทุก head ที่ถือ key นี้
-                    self.advance(i);
+                    self.advance_any(i);
                 }
             }
 

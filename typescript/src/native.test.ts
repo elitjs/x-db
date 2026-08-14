@@ -297,7 +297,8 @@ test("store: realtime loop 100 puts อ่านกลับทันที", ()
 });
 
 test("store: auto-compact ที่ 8 layers", () => {
-  const store = new XdbStore(tempStore("autocompact"));
+  // flushEntries: 1 → ทุก put กลายเป็น layer ทันที (จะได้เห็น threshold ทำงาน)
+  const store = new XdbStore(tempStore("autocompact"), { compactThreshold: 8, flushEntries: 1 });
   for (let i = 0; i < 7; i++) {
     store.put([[`k${i}`, `v${i}`]]);
   }
@@ -400,4 +401,64 @@ test("store: เปิดซ้อน directory เดียวกันต้�
   const reopened = new XdbStore(dir); // ต้องเปิดได้ทันที
   assert.equal(reopened.getUtf8("a"), "1");
   reopened.close();
+});
+
+// ---------------- WAL + memtable ----------------
+
+test("store: put เข้า memtable → get เห็นทันที → flush → เป็น layer", () => {
+  const store = new XdbStore(tempStore("wal_basic"));
+  store.put([["a", "1"], ["b", "2"]]);
+
+  assert.equal(store.memtableLen, 2);
+  assert.equal(store.layerCount, 0);
+  assert.equal(store.getUtf8("a"), "1");
+
+  store.flush();
+  assert.equal(store.memtableLen, 0);
+  assert.equal(store.layerCount, 1);
+  assert.equal(store.getUtf8("a"), "1"); // ข้อมูลยังอยู่จาก layer
+  store.close();
+});
+
+test("store: WAL replay — เปิดใหม่โดยไม่ flush ข้อมูลไม่หาย", () => {
+  const dir = tempStore("wal_replay");
+  {
+    const store = new XdbStore(dir);
+    store.put([["a", "1"], ["b", "2"]]);
+    store.delete("b");
+    store.close(); // ไม่ได้ flush — ปล่อยให้ WAL ทำหน้าที่
+  }
+  const store = new XdbStore(dir);
+  assert.equal(store.memtableLen, 2); // replay รวมเป็น {a, b:tombstone}
+  assert.equal(store.getUtf8("a"), "1");
+  assert.equal(store.getUtf8("b"), null); // ยังถูกลบอยู่
+  store.close();
+});
+
+test("store: batch put 1000 keys ในคำสั่งเดียว", () => {
+  const store = new XdbStore(tempStore("wal_batch"));
+  const entries: Array<[string, string]> = [];
+  for (let i = 0; i < 1000; i++) entries.push([`k:${String(i).padStart(5, "0")}`, `v${i}`]);
+
+  const t0 = performance.now();
+  store.put(entries);
+  const ms = performance.now() - t0;
+  console.log(`       batch put 1000 keys: ${ms.toFixed(2)} ms (${(ms * 1000 / 1000).toFixed(1)} µs/key)`);
+
+  assert.equal(store.memtableLen, 1000);
+  assert.equal(store.getUtf8("k:00999"), "v999");
+  store.close();
+});
+
+test("store: sync=false ใช้ได้ปกติ", () => {
+  const dir = tempStore("nosync");
+  {
+    const store = new XdbStore(dir, { sync: false });
+    store.put([["fast", "1"]]);
+    assert.equal(store.getUtf8("fast"), "1");
+    store.close();
+  }
+  const store = new XdbStore(dir);
+  assert.equal(store.getUtf8("fast"), "1");
+  store.close();
 });

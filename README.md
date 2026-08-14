@@ -104,14 +104,16 @@ const count = mergeTables(["old.xdb", "new.xdb"], "merged.xdb");
 ## XDBStore — สำหรับแอปที่ update แบบ realtime
 
 `writeTable` เหมาะกับข้อมูลนิ่ง แต่ถ้าแอปต้อง put/delete ตลอดเวลา ให้ใช้ `XdbStore`:
-ข้อมูลอยู่เป็นหลาย layers ซ้อนกัน (LSM-lite) — put = เขียน layer เล็กใหม่ (เร็ว ~5ms รวม fsync),
-get = ค้นข้าม layers ตัวใหม่ชนะ, delete = tombstone, และ **compact อัตโนมัติ** เมื่อครบ 8 layers
+put เขียน **WAL + memtable** ก่อน (single key ~0.9ms รวม fsync, **batch ~2.2µs/key**),
+memtable เต็ม (default 4096) จะ flush เป็น layer อัตโนมัติ, get = memtable → layers ตัวใหม่ชนะ,
+delete = tombstone, และ **compact อัตโนมัติ** เมื่อครบ 8 layers (บีบอัด LZ4)
 
 ```ts
 import { XdbStore } from "xdb-native";
 
 const store = new XdbStore("./mydata");          // directory (สร้างให้เอง)
-// const store = new XdbStore("./mydata", { compactThreshold: 0 }); // ปิด auto-compact
+// ตัวเลือก: { compactThreshold: 8, flushEntries: 4096, sync: true }
+// sync: false = เร็วขึ้น (ไม่ fsync ทุก put) แต่ process พังกลางทางอาจเสีย put ล่าสุด
 
 store.put([["alice", "engineer"]]);               // insert
 store.put([["alice", "senior engineer"]]);        // update — ทันที
@@ -124,8 +126,9 @@ for (let i = 0; i < 100; i++) store.put([[`c:${i}`, String(i)]]); // realtime �
 
 จาก Rust: `XDBStore::open(dir)` / `open_with(dir, threshold)` — API เดียวกัน
 
-หมายเหตุ: get ของ store เห็นข้อมูลล่าสุดทันทีหลัง put (อ่านผ่าน mmap เหมือนเดิม แค่ไล่หลาย layers)
-ส่วน compaction ของตารางใหญ่มีค่าใช้จ่าย — ถ้า base ใหญ่มากและเขียนถี่ แนะนำ batch หลาย keys ต่อ put
+ความทนทาน: ทุก put ลง WAL ก่อนตอบกลับ — ปิดแอป/พังกลางทางแล้วเปิดใหม่ ข้อมูลถูก replay ครบ
+(มี test ทดสอบทั้ง crash กลาง batch และ tombstone replay) ส่วน compaction ของตารางใหญ่มีค่าใช้จ่าย —
+ถ้า base ใหญ่มากและเขียนถี่ แนะนำ batch หลาย keys ต่อ put
 
 ## ใช้จาก Rust
 
@@ -174,7 +177,7 @@ xdb merge  out.xdb a.xdb b.xdb --compress   # รวมตาราง (บี�
 ## รัน tests
 
 ```bash
-cargo test                 # ไลบรารี Rust (38 tests) + CLI (8 integration tests)
+cargo test                 # ไลบรารี Rust (44 tests) + CLI (8 integration tests)
 cd typescript && npm test  # native binding จาก TS (27 tests)
 npm run example            # ตัวอย่างการใช้งาน
 cargo run --release --example bench   # benchmark

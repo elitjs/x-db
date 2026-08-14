@@ -55,6 +55,8 @@ interface NativeStoreIterator {
 interface NativeStore {
   close(): void;
   readonly layerCount: number;
+  readonly memtableLen: number;
+  flush(): void;
   put(entries: Entry[]): void;
   delete(keys: Array<string | Uint8Array>): void;
   get(key: string | Uint8Array): Buffer | null;
@@ -67,6 +69,10 @@ interface NativeStore {
 export interface XdbStoreOptions {
   /** จำนวน layers ที่ trigger compact อัตโนมัติ (default 8, 0 = ปิด — เรียก compact() เอง) */
   compactThreshold?: number;
+  /** จำนวน entries ใน memtable ที่ trigger flush เป็น layer (default 4096, 0 = flush เองเท่านั้น) */
+  flushEntries?: number;
+  /** fsync WAL ทุก put (default true) — false = เร็วขึ้นแต่ process พังกลางทางอาจเสีย put ล่าสุด */
+  sync?: boolean;
 }
 
 interface NativeApi {
@@ -74,7 +80,10 @@ interface NativeApi {
   /** รวมหลายไฟล์ .xdb เป็นไฟล์เดียว — ไฟล์หลังสุดชนะเมื่อ key ซ้ำ คืนจำนวน entries ผลลัพธ์ */
   mergeTables(inputs: string[], output: string): number;
   XdbReader: new (path: string) => NativeReader;
-  XdbStore: new (path: string, compactThreshold?: number) => NativeStore;
+  XdbStore: new (
+    path: string,
+    options?: { compactThreshold?: number; flushEntries?: number; sync?: boolean },
+  ) => NativeStore;
 }
 
 // ---- helpers ----
@@ -235,7 +244,7 @@ export class XdbStore {
   readonly #inner: NativeStore;
 
   constructor(path: string, options: XdbStoreOptions = {}) {
-    this.#inner = new native.XdbStore(path, options.compactThreshold);
+    this.#inner = new native.XdbStore(path, options);
   }
 
   /** ปิด store + ปลด lock ของ directory — เรียกเมื่อใช้เสร็จ (ไม่เรียกก็ได้ จะปลดตอน GC) */
@@ -246,6 +255,16 @@ export class XdbStore {
   /** จำนวน layers ปัจจุบัน (ครบ 8 จะถูก compact อัตโนมัติเหลือ 1) */
   get layerCount(): number {
     return this.#inner.layerCount;
+  }
+
+  /** จำนวน entries ใน memtable ที่ยังไม่ได้ flush เป็น layer */
+  get memtableLen(): number {
+    return this.#inner.memtableLen;
+  }
+
+  /** ดัน memtable ลง layer ถาวร + ล้าง WAL (ปกติ auto ตาม flushEntries อยู่แล้ว) */
+  flush(): void {
+    this.#inner.flush();
   }
 
   /** เพิ่ม/แก้ค่า (upsert) — รับ Array / Map / Object, ไม่เรียงก็ได้, key ซ้ำตัวหลังชนะ */

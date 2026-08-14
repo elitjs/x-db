@@ -113,7 +113,16 @@ fn main() -> io::Result<()> {
         store.put(&[(key.as_bytes(), val.as_slice())])?;
     }
     let put_ms = t.elapsed().as_secs_f64() * 1000.0 / 100.0;
-    println!("store   : single-key put เฉลี่ย {put_ms:.2} ms/op (รวม fsync) — layer_count = {}", store.layer_count());
+    println!("store   : single-key put เฉลี่ย {put_ms:.2} ms/op (รวม fsync) — memtable = {}", store.memtable_len());
+
+    // batch 1000 keys ใน put เดียว — fsync รวมทั้ง batch เลยถูกมาก
+    let batch: Vec<(String, String)> = (0..1000)
+        .map(|i| (format!("bulk:{i:06}"), format!("bulk-value-{i}")))
+        .collect();
+    let t = Instant::now();
+    store.put(&batch.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())).collect::<Vec<_>>())?;
+    let batch_us = t.elapsed().as_secs_f64() * 1e6 / 1000.0;
+    println!("store   : batch put 1000 keys เฉลี่ย {batch_us:.1} µs/key (fsync ทั้ง batch ครั้งเดียว)");
 
     let t = Instant::now();
     let mut found = 0;

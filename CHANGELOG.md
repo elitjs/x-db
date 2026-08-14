@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased (v0.3.0)
+
+### WAL + memtable — เขียนเร็วขึ้น 20-1000 เท่า
+- put/delete เขียนลง **WAL + memtable** แทนการสร้างไฟล์ layer ทุกครั้ง
+  - single key: ~0.9ms (รวม fsync) จาก ~5ms
+  - batch 1000 keys: **~2.2µs/key** (~450k puts/sec)
+- memtable เต็ม (default 4096 entries) → flush เป็น layer อัตโนมัติ
+- **Crash-safe**: เปิดใหม่แล้ว replay WAL ครบ (torn tail จาก crash ถูกตัดอัตโนมัติ)
+- `StoreOptions { compact_threshold, flush_entries, sync }` + `flush()` + `memtable_len()`
+- TS: `new XdbStore(path, { compactThreshold, flushEntries, sync })`, `store.flush()`, `store.memtableLen`
+
 ## v0.2.0 (2026-08-14)
 
 เวอร์ชันที่เพิ่มของจริงเยอะหลังจาก v0.1.0 — สรุปเป็นกลุ่ม:
