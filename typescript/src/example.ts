@@ -27,8 +27,8 @@ console.log(reader.has("bye")); // true
 console.log(reader.count); // 3
 
 // 3. iterate ทั้งตาราง (เรียงตาม key)
-for (const { key, value } of reader) {
-  // ...
+for (const { key } of reader) {
+  console.log(Buffer.from(key).toString("utf8"));
 }
 
 // 4. merge/compaction: รวมหลายตารางเป็นไฟล์เดียว (ไฟล์หลังสุดชนะเมื่อ key ซ้ำ)

@@ -21,7 +21,7 @@
  *   15. Error handling: ไฟล์เสีย / เปิดซ้อน
  *   16. ใช้กับ xdb-server ผ่าน HTTP (แนะนำสั้น ๆ)
  */
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {

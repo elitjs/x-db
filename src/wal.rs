@@ -10,7 +10,7 @@ use crate::TOMBSTONE_FLAG;
 use crc32fast::hash as crc32;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const RECORD_HEADER: usize = 4 + 2 + 4;
 
@@ -19,7 +19,6 @@ pub type WalEntry = (Vec<u8>, Option<Vec<u8>>);
 
 pub struct Wal {
     file: File,
-    path: PathBuf,
     sync: bool,
     /// buffer reuse ระหว่าง append รอบ (ไม่ allocate ใหม่ทุก batch)
     buf: Vec<u8>,
@@ -72,10 +71,7 @@ impl Wal {
         }
         file.seek(SeekFrom::End(0))?;
 
-        Ok((
-            Self { file, path: path.to_path_buf(), sync, buf: Vec::new() },
-            entries,
-        ))
+        Ok((Self { file, sync, buf: Vec::new() }, entries))
     }
 
     /// เขียน batch ลง WAL (fsync ตาม `sync`) — เขียนทั้ง batch ใน write เดียว
@@ -131,10 +127,5 @@ impl Wal {
             self.file.sync_data()?;
         }
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }

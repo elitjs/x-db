@@ -71,16 +71,6 @@ impl BloomFilter {
         self.bits[bit2 >> 3] |= 1 << (bit2 & 7);
     }
 
-    #[inline(always)]
-    pub fn might_contain(&self, key: &[u8]) -> bool {
-        let (h1, h2) = Self::get_hashes(key);
-        let bit1 = h1 % self.size;
-        let bit2 = h2 % self.size;
-        let b1 = self.bits[bit1 >> 3] & (1 << (bit1 & 7));
-        let b2 = self.bits[bit2 >> 3] & (1 << (bit2 & 7));
-        b1 != 0 && b2 != 0
-    }
-
     pub fn len_bytes(&self) -> usize {
         self.bits.len()
     }

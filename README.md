@@ -13,7 +13,6 @@ Read-only key-value store แบบ SSTable (Rust) เรียกใช้จ�
   พร้อม **file locking** (เปิดซ้อนหลาย process ไม่ได้ — กันข้อมูลเสียหาย) และ `close()` ปลดล็อก
 - **seek / range / prefix**: iterator กระโดดไปตำแหน่ง key ได้เลย (ไม่ต้องไล่ตั้งแต่ต้น)
 - **Native addon**: Rust compile เป็น `.node` เรียกจาก Node.js/TypeScript ตรง ๆ ใน process เดียวกัน
-- **(เสริม) HTTP server**: `xdb-server` binary สำหรับกรณีอยาก serve ผ่านเครือข่าย
 
 ## Benchmark (ตัวอย่าง, `cargo run --release --example bench`)
 
@@ -78,7 +77,6 @@ cache 64MB) — จาก test: ตาราง text 100k entries เล็ก�
 
 ```
 src/lib.rs             ไลบรารีหลัก: XDBWriter / XDBReader / BloomFilter / XDBIter
-src/main.rs            (เสริม) xdb-server: HTTP API (axum)
 examples/bench.rs      benchmark
 crates/xdb-node/       napi-rs binding: Rust → Node.js addon
 typescript/            npm package "xdb-native": TS wrapper + tests + example
@@ -93,7 +91,7 @@ cd typescript && npm run cookbook
 17 เคสใน `typescript/src/cookbook.ts`: ตารางเดี่ยว, binary, JSON, range/prefix/seek,
 realtime CRUD, batch import 10k rows, เลือก durability 3 โหมด, เก็บไฟล์+chunking,
 cache แบบ TTL, counter, session store + ล้างหมดอายุ, key design (เลขเรียงถูก),
-merge ฐาน+delta, compact มือ, error handling, ผูก xdb-server, performance tips
+merge ฐาน+delta, compact มือ, error handling, multi-process patterns, performance tips
 
 ## ใช้จาก TypeScript (native binding)
 

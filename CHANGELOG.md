@@ -2,6 +2,12 @@
 
 ## Unreleased (v0.3.0)
 
+### Cleanup — ลบ code ที่ไม่ได้ใช้
+- ลบ xdb-server (HTTP mode) + dependencies axum/tokio/serde/serde_json/base64
+  — โปรเจกต์นี้ใช้ทาง native binding เป็นหลัก (ต้องการกลับมาได้จาก git history)
+- ลบ Wal::path(), Wal.path field, BloomFilter::might_contain() (ไม่มีผู้เรียก)
+- แก้ TS unused imports (cookable/example) — tsc noUnusedLocals สะอาด
+
 ### Periodic sync — คุมช่องเสียข้อมูลตอนไฟดับของโหมด nosync
 - `StoreOptions.sync_interval_ms` (TS: `syncIntervalMs`): เมื่อ sync=false จะมี background thread
   fsync WAL ทุก N ms → put ยังเร็วเท่าเดิม แต่เสียข้อมูลตอนไฟดับได้สูงสุดแค่ N ms (เดิม: ไม่จำกัด)
