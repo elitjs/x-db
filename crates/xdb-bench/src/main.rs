@@ -317,5 +317,409 @@ fn main() -> Result<(), Box<dyn Error>> {
     for f in ["xdb.xdb", "sqlite.db", "redb.db"] {
         let _ = std::fs::remove_file(dir.join(f));
     }
+
+    oltp_main()?;
     Ok(())
+}
+
+// =====================================================================
+// OLTP benchmark: เขียน / อัพเดต / ลบ / อ่าน ราย operation
+// =====================================================================
+
+const OP_N: usize = 10_000; // จำนวน ops ต่อ phase (fsync-heavy จึงไม่เยอะ)
+const BATCH: usize = 1_000; // ขนาด batch
+
+struct OltpRow {
+    name: String,
+    write_ns: f64,
+    batch_ns: f64, // ns/key เมื่อเขียนแบบ batch
+    update_ns: f64,
+    delete_ns: f64,
+    hit_ns: f64,
+    miss_ns: f64,
+}
+
+fn base_key(i: usize) -> Vec<u8> {
+    format!("k:{i:07}").into_bytes()
+}
+fn op_val(i: usize) -> Vec<u8> {
+    format!("value-of-{i}-xxxxxxxxxx").into_bytes()
+}
+
+fn oltp_main() -> Result<(), Box<dyn Error>> {
+    let dir = std::env::temp_dir().join("xdb_oltp_bench");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+
+    println!();
+    println!("=== OLTP: เขียน/อัพเดต/ลบ/อ่าน ราย operation ({OP_N} ops/phase) ===");
+    let rows = vec![
+        oltp_xdb(&dir, true, "x-db(sync)")?,
+        oltp_xdb(&dir, false, "x-db(nosync)")?,
+        oltp_sqlite(&dir)?,
+        oltp_redb(&dir)?,
+        oltp_hashmap(),
+    ];
+
+    println!();
+    println!(
+        "{:<14} {:>11} {:>14} {:>11} {:>11} {:>9} {:>9}",
+        "database", "put(ns)", "batch(ns/k)", "update(ns)", "delete(ns)", "get(ns)", "miss(ns)"
+    );
+    for r in &rows {
+        println!(
+            "{:<14} {:>11.0} {:>14.1} {:>11.0} {:>11.0} {:>9.0} {:>9.0}",
+            r.name, r.write_ns, r.batch_ns, r.update_ns, r.delete_ns, r.hit_ns, r.miss_ns
+        );
+    }
+    println!();
+    println!("หมายเหตุ:");
+    println!("- x-db(sync) = fsync WAL ทุก op / (nosync) = ปิด fsync (ยอมรับเสีย op ล่าสุดถ้าพังกลางทาง)");
+    println!("- SQLite ใช้ WAL + synchronous=NORMAL (ค่าที่แนะนำ) — autocommit ต่อ statement");
+    println!("- redb = 1 transaction ต่อ op (durability เต็ม)");
+    println!("- ทุก phase ตรวจ correctness (อ่านคืน/นับ) ก่อนขึ้น phase ถัดไป");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+fn oltp_xdb(dir: &Path, sync: bool, label: &str) -> Result<OltpRow, Box<dyn Error>> {
+    use x_db::store::{StoreOptions, XDBStore};
+    let d = dir.join(if sync { "xdb_sync" } else { "xdb_nosync" });
+    let store = XDBStore::open_opts(&d, StoreOptions { compact_threshold: 8, flush_entries: 4096, sync })?;
+
+    // preload base keys (batch)
+    let base: Vec<(Vec<u8>, Vec<u8>)> = (0..OP_N).map(|i| (base_key(i), op_val(i))).collect();
+    {
+        let refs: Vec<(&[u8], &[u8])> = base.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        store.put(&refs)?;
+    }
+
+    // write: single-key inserts (keys ใหม่)
+    let t = Instant::now();
+    for i in 0..OP_N {
+        let k = format!("w:{i:07}").into_bytes();
+        let v = op_val(i);
+        store.put(&[(k.as_slice(), v.as_slice())])?;
+    }
+    let write_ns = ns_per(t, OP_N);
+    assert_eq!(store.get(format!("w:{:07}", OP_N - 1).as_bytes())?, Some(op_val(OP_N - 1)));
+
+    // batch write
+    let t = Instant::now();
+    for b in 0..OP_N / BATCH {
+        let batch: Vec<(Vec<u8>, Vec<u8>)> = (0..BATCH)
+            .map(|j| (format!("b:{:07}", b * BATCH + j).into_bytes(), op_val(j)))
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = batch.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        store.put(&refs)?;
+    }
+    let batch_ns = ns_per(t, OP_N);
+    assert_eq!(store.get(format!("b:{:07}", OP_N - 1).as_bytes())?, Some(op_val(BATCH - 1)));
+
+    // update: overwrite base keys
+    let t = Instant::now();
+    for i in 0..OP_N {
+        let v = format!("updated-{i}").into_bytes();
+        store.put(&[(base_key(i).as_slice(), v.as_slice())])?;
+    }
+    let update_ns = ns_per(t, OP_N);
+    assert_eq!(store.get(&base_key(0))?, Some(b"updated-0".to_vec()));
+
+    // get hit / miss
+    let t = Instant::now();
+    let mut found = 0;
+    for i in 0..OP_N {
+        if store.get(&base_key(i * 7919 % OP_N))?.is_some() {
+            found += 1;
+        }
+    }
+    let hit_ns = ns_per(t, OP_N);
+    assert_eq!(found, OP_N);
+    let t = Instant::now();
+    let mut rejected = 0;
+    for i in 0..OP_N {
+        if store.get(format!("zzz:{i:07}").as_bytes())?.is_none() {
+            rejected += 1;
+        }
+    }
+    let miss_ns = ns_per(t, OP_N);
+    assert_eq!(rejected, OP_N);
+
+    // delete
+    let t = Instant::now();
+    for i in 0..OP_N {
+        store.delete(&[base_key(i).as_slice()])?;
+    }
+    let delete_ns = ns_per(t, OP_N);
+    assert_eq!(store.get(&base_key(5))?, None);
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(&d);
+    Ok(OltpRow {
+        name: label.to_string(),
+        write_ns,
+        batch_ns,
+        update_ns,
+        delete_ns,
+        hit_ns,
+        miss_ns,
+    })
+}
+
+fn oltp_sqlite(dir: &Path) -> Result<OltpRow, Box<dyn Error>> {
+    let path = dir.join("sqlite.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = Connection::open(&path)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         CREATE TABLE kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID;",
+    )?;
+
+    // preload (batch)
+    {
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT INTO kv VALUES (?, ?)")?;
+            for i in 0..OP_N {
+                stmt.execute(params![base_key(i), op_val(i)])?;
+            }
+        }
+        tx.commit()?;
+    }
+
+    // write: single inserts (autocommit)
+    let t = Instant::now();
+    for i in 0..OP_N {
+        conn.execute("INSERT INTO kv VALUES (?, ?)", params![format!("w:{i:07}"), op_val(i)])?;
+    }
+    let write_ns = ns_per(t, OP_N);
+
+    // batch write
+    let t = Instant::now();
+    for b in 0..OP_N / BATCH {
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT INTO kv VALUES (?, ?)")?;
+            for j in 0..BATCH {
+                stmt.execute(params![format!("b:{:07}", b * BATCH + j), op_val(j)])?;
+            }
+        }
+        tx.commit()?;
+    }
+    let batch_ns = ns_per(t, OP_N);
+
+    // update
+    let t = Instant::now();
+    for i in 0..OP_N {
+        conn.execute("UPDATE kv SET v = ? WHERE k = ?", params![format!("updated-{i}").into_bytes(), base_key(i)])?;
+    }
+    let update_ns = ns_per(t, OP_N);
+
+    // get hit / miss
+    let mut stmt = conn.prepare("SELECT v FROM kv WHERE k = ?")?;
+    let t = Instant::now();
+    let mut found = 0;
+    for i in 0..OP_N {
+        let r: Result<Vec<u8>, _> = stmt.query_row(params![base_key(i * 7919 % OP_N)], |row| row.get(0));
+        if r.is_ok() {
+            found += 1;
+        }
+    }
+    let hit_ns = ns_per(t, OP_N);
+    assert_eq!(found, OP_N);
+    let t = Instant::now();
+    let mut rejected = 0;
+    for i in 0..OP_N {
+        let r: Result<Vec<u8>, _> = stmt.query_row(params![format!("zzz:{i:07}")], |row| row.get(0));
+        if r.is_err() {
+            rejected += 1;
+        }
+    }
+    let miss_ns = ns_per(t, OP_N);
+    assert_eq!(rejected, OP_N);
+
+    // delete
+    let t = Instant::now();
+    for i in 0..OP_N {
+        conn.execute("DELETE FROM kv WHERE k = ?", params![base_key(i)])?;
+    }
+    let delete_ns = ns_per(t, OP_N);
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))?;
+    assert_eq!(count, (OP_N * 2) as i64); // เหลือ w: + b: keys
+
+    drop(stmt);
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(dir.join("sqlite.db-wal"));
+    let _ = std::fs::remove_file(dir.join("sqlite.db-shm"));
+    Ok(OltpRow {
+        name: "SQLite(WAL)".into(),
+        write_ns,
+        batch_ns,
+        update_ns,
+        delete_ns,
+        hit_ns,
+        miss_ns,
+    })
+}
+
+fn oltp_redb(dir: &Path) -> Result<OltpRow, Box<dyn Error>> {
+    use redb::{Database, TableDefinition};
+    const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
+    let path = dir.join("redb.db");
+    let _ = std::fs::remove_file(&path);
+    let db = Database::create(&path)?;
+
+    // preload (batch ใหญ่)
+    {
+        let tx = db.begin_write()?;
+        {
+            let mut t = tx.open_table(TABLE)?;
+            for i in 0..OP_N {
+                t.insert(base_key(i).as_slice(), op_val(i).as_slice())?;
+            }
+        }
+        tx.commit()?;
+    }
+
+    // write: 1 txn ต่อ op
+    let t = Instant::now();
+    for i in 0..OP_N {
+        let tx = db.begin_write()?;
+        {
+            let mut tb = tx.open_table(TABLE)?;
+            tb.insert(format!("w:{i:07}").as_bytes(), op_val(i).as_slice())?;
+        }
+        tx.commit()?;
+    }
+    let write_ns = ns_per(t, OP_N);
+
+    // batch write
+    let t = Instant::now();
+    for b in 0..OP_N / BATCH {
+        let tx = db.begin_write()?;
+        {
+            let mut tb = tx.open_table(TABLE)?;
+            for j in 0..BATCH {
+                tb.insert(format!("b:{:07}", b * BATCH + j).as_bytes(), op_val(j).as_slice())?;
+            }
+        }
+        tx.commit()?;
+    }
+    let batch_ns = ns_per(t, OP_N);
+
+    // update
+    let t = Instant::now();
+    for i in 0..OP_N {
+        let tx = db.begin_write()?;
+        {
+            let mut tb = tx.open_table(TABLE)?;
+            tb.insert(base_key(i).as_slice(), format!("updated-{i}").as_bytes())?;
+        }
+        tx.commit()?;
+    }
+    let update_ns = ns_per(t, OP_N);
+
+    // get hit / miss (read txn รวม)
+    let read = db.begin_read()?;
+    let table = read.open_table(TABLE)?;
+    let t = Instant::now();
+    let mut found = 0;
+    for i in 0..OP_N {
+        if table.get(base_key(i * 7919 % OP_N).as_slice())?.is_some() {
+            found += 1;
+        }
+    }
+    let hit_ns = ns_per(t, OP_N);
+    assert_eq!(found, OP_N);
+    let t = Instant::now();
+    let mut rejected = 0;
+    for i in 0..OP_N {
+        if table.get(format!("zzz:{i:07}").as_bytes())?.is_none() {
+            rejected += 1;
+        }
+    }
+    let miss_ns = ns_per(t, OP_N);
+    assert_eq!(rejected, OP_N);
+    drop(table);
+    drop(read);
+
+    // delete
+    let t = Instant::now();
+    for i in 0..OP_N {
+        let tx = db.begin_write()?;
+        {
+            let mut tb = tx.open_table(TABLE)?;
+            tb.remove(base_key(i).as_slice())?;
+        }
+        tx.commit()?;
+    }
+    let delete_ns = ns_per(t, OP_N);
+    {
+        let read = db.begin_read()?;
+        let table = read.open_table(TABLE)?;
+        assert!(table.get(base_key(5).as_slice())?.is_none());
+        let count = table.range::<&[u8]>(..)?.count();
+        assert_eq!(count, OP_N * 2); // เหลือ w: + b:
+    }
+
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    Ok(OltpRow {
+        name: "redb".into(),
+        write_ns,
+        batch_ns,
+        update_ns,
+        delete_ns,
+        hit_ns,
+        miss_ns,
+    })
+}
+
+fn oltp_hashmap() -> OltpRow {
+    let mut map: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(OP_N * 3);
+    for i in 0..OP_N {
+        map.insert(base_key(i), op_val(i));
+    }
+
+    let t = Instant::now();
+    for i in 0..OP_N {
+        map.insert(format!("w:{i:07}").into_bytes(), op_val(i));
+    }
+    let write_ns = ns_per(t, OP_N);
+
+    let t = Instant::now();
+    for i in 0..OP_N {
+        map.insert(base_key(i), format!("updated-{i}").into_bytes());
+    }
+    let update_ns = ns_per(t, OP_N);
+
+    let t = Instant::now();
+    let mut found = 0;
+    for i in 0..OP_N {
+        if map.contains_key(&base_key(i * 7919 % OP_N)) {
+            found += 1;
+        }
+    }
+    let hit_ns = ns_per(t, OP_N);
+    assert_eq!(found, OP_N);
+
+    let t = Instant::now();
+    for i in 0..OP_N {
+        map.remove(&base_key(i));
+    }
+    let delete_ns = ns_per(t, OP_N);
+    assert!(map.contains_key(&format!("w:{:07}", 0).into_bytes()));
+
+    OltpRow {
+        name: "HashMap(RAM)".into(),
+        write_ns,
+        batch_ns: f64::NAN,
+        update_ns,
+        delete_ns,
+        hit_ns,
+        miss_ns: f64::NAN,
+    }
 }
