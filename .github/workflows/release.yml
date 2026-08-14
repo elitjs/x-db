@@ -82,13 +82,13 @@ jobs:
 
       - name: Assemble package
         run: |
-          mkdir -p typescript/dist typescript/prebuilds
+          mkdir -p typescript/dist
           FIRST=$(ls artifacts/ | head -1)
           cp artifacts/$FIRST/xdb.cjs typescript/
           cp artifacts/$FIRST/xdb.d.ts typescript/
           cp -r artifacts/$FIRST/dist/* typescript/dist/
-          for d in artifacts/*/; do cp $d*.node typescript/prebuilds/ 2>/dev/null || true; done
-          ls -la typescript/ typescript/prebuilds/
+          for d in artifacts/*/; do cp $d*.node typescript/ 2>/dev/null || true; done
+          ls -la typescript/
 
       - name: Publish
         working-directory: typescript
@@ -101,4 +101,4 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            typescript/prebuilds/*.node
+            typescript/*.node

@@ -8,7 +8,8 @@
   "files": [
     "dist",
     "xdb.cjs",
-    "xdb.d.ts"
+    "xdb.d.ts",
+    "*.node"
   ],
   "scripts": {
     "native:build": "napi build --platform --release --cargo-cwd ../crates/xdb-node --js xdb.cjs --dts xdb.d.ts .",
