@@ -9,7 +9,7 @@ keywords = ["database", "key-value", "embedded", "mmap", "sst"]
 categories = ["database", "data-structures"]
 
 [workspace]
-members = ["crates/xdb-node", "crates/xdb-bench"]
+members = ["crates/xdb-node", "crates/xdb-bench", "crates/xdb-cli"]
 
 
 [dependencies]

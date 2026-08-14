@@ -933,6 +933,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "xdb-cli"
+version = "0.1.0"
+dependencies = [
+ "x-db",
+]
+
+[[package]]
 name = "xdb-node"
 version = "0.1.0"
 dependencies = [

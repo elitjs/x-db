@@ -161,10 +161,20 @@ for entry in reader.iter() {
 restart points (เลือกช่วง 16 entries ใน block) → linear scan สั้น ๆ — เร็วขึ้น ~2 เท่าจาก
 การไล่ block ทั้งก้อนตรง ๆ
 
+## CLI (`cargo install --path crates/xdb-cli` หรือ `./target/release/xdb.exe`)
+
+```bash
+xdb check  data.xdb                 # ตรวจไฟล์: CRC ทุก block + key เรียงถูก + จำนวนตรง footer
+xdb stats  data.xdb                 # entries / blocks / bloom / อัตราบีบอัด
+xdb dump   data.xdb --prefix u:42:  # แสดง entries (--start, --limit, --keys-only)
+xdb get    data.xdb "user:42"       # ค้นหา key เดียว
+xdb merge  out.xdb a.xdb b.xdb --compress   # รวมตาราง (บีบอัดได้)
+```
+
 ## รัน tests
 
 ```bash
-cargo test                 # ไลบรารี Rust (38 tests รวม compression, corruption, merge, seek/range, file lock)
+cargo test                 # ไลบรารี Rust (38 tests) + CLI (8 integration tests)
 cd typescript && npm test  # native binding จาก TS (27 tests)
 npm run example            # ตัวอย่างการใช้งาน
 cargo run --release --example bench   # benchmark

@@ -583,6 +583,21 @@ impl XDBReader {
         self.bloom_len
     }
 
+    /// สถิติการบีบอัด: (จำนวน block บีบอัด, จำนวน block ทั้งหมด, ไบต์ก่อนบีบอัด, ไบต์หลังบีบอัด)
+    pub fn compression_stats(&self) -> (usize, usize, u64, u64) {
+        let mut compressed = 0usize;
+        let mut raw: u64 = 0;
+        let mut stored: u64 = 0;
+        for be in &self.index {
+            if be.compressed {
+                compressed += 1;
+            }
+            raw += be.raw_len as u64;
+            stored += (be.length - 8) as u64;
+        }
+        (compressed, self.index.len(), raw, stored)
+    }
+
     /// ค้นหา key → ค่า (คัดลอกค่าออกมาให้เพราะ block อาจถูกบีบอัดและอยู่ใน cache)
     /// Err = ไฟล์เสียหาย, Ok(None) = ไม่มี key นี้ (หรือเจอ tombstone)
     #[inline]

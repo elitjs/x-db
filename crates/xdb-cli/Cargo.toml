@@ -1,0 +1,12 @@
+[package]
+name = "xdb-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tools สำหรับ x-db: check / stats / dump / get / merge"
+
+[[bin]]
+name = "xdb"
+path = "src/main.rs"
+
+[dependencies]
+x-db = { path = "../.." }
