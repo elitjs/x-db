@@ -1,3 +1,6 @@
+export { Mongo, Collection, FindCursor } from "./mongo.js";
+export type { MongoDoc, Filter, UpdateSpec, SortSpec, FieldOps } from "./mongo.js";
+
 /**
  * x-db native binding สำหรับ TypeScript/Node.js
  *

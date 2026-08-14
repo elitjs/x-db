@@ -174,6 +174,33 @@ db.save()?;                                           // atomic — reader เ�
 db.close()?;                                          // เหลือไฟล์เดียวพกไปไหนก็ได้
 ```
 
+### Mongo layer — API สไตล์ MongoDB Node.js driver
+
+```ts
+import { XDB, Mongo } from "xdb-native";
+
+const mdb = new Mongo(new XDB("./app.xdb"));
+const users = mdb.collection("users");
+
+users.insertOne({ name: "สมชาย", age: 30 });           // _id สร้างให้อัตโนมัติ
+users.insertMany([{ name: "สมหญิง", age: 25 }]);
+
+users.findOne({ name: "สมชาย" });
+users.findById(id);
+users.find({ age: { $gte: 18 } })
+  .sort({ age: -1 }).skip(10).limit(5).toArray();      // cursor แบบ MongoDB
+
+users.updateOne({ _id: id }, { $set: { age: 31 }, $inc: { login: 1 } });
+users.updateMany({ status: "inactive" }, { $set: { archived: true } });
+users.deleteMany({ status: "inactive" });
+users.countDocuments({ age: { $gt: 20 } });
+
+mdb.close();
+```
+
+รองรับ: filter `$and/$or/$nor/$eq/$ne/$gt/$gte/$lt/$lte/$in/$nin/$exists/$regex`
++ dot notation (`"address.city"`) · update `$set/$unset/$inc/$push` + replace ทั้ง doc
+
 ไฟล์ที่ได้ใช้ร่วมกับ `writeTable`/`XDBReader` ได้ทั้งสองทาง
 
 ## XdbSingleFile — ไฟล์ .xdb เดียวจบ (เขียน+อ่าน ไม่พัง)

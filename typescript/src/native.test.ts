@@ -656,3 +656,132 @@ test("XDB: snapshot — เปิดอ่านเร็วสุดจาก�
   assert.equal(db.get("k:42"), "updated");
   db.close();
 });
+
+// ---------------- Mongo layer: MongoDB-style API ----------------
+
+import { Mongo } from "./index.js";
+
+test("Mongo: insert / findOne / findById / find", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-"));
+  const mdb = new Mongo(new XDB(join(dir, "app.xdb")));
+  const users = mdb.collection("users");
+
+  const { insertedId } = users.insertOne({ name: "สมชาย", age: 30, role: "admin" });
+  assert.ok(typeof insertedId === "string" && insertedId.length > 0);
+
+  users.insertMany([
+    { name: "สมหญิง", age: 25, role: "user" },
+    { name: "ดำ", age: 35, role: "user" },
+    { name: "แดง", age: 20, role: "user" },
+    { name: "เด็ก", age: 12, role: "guest" },
+  ]);
+
+  assert.equal(users.countDocuments(), 5);
+
+  // findOne แบบ equality
+  const a = users.findOne({ name: "สมชาย" });
+  assert.equal(a?.age, 30);
+  assert.equal(a?._id, insertedId);
+
+  // findById
+  assert.equal(users.findById(insertedId)?.name, "สมชาย");
+  assert.equal(users.findById("no-such-id"), null);
+
+  // find + $gte
+  const adults = users.find({ age: { $gte: 18 } }).toArray();
+  assert.equal(adults.length, 4); // ตัดเด็ก 12 ปี
+
+  // sort + skip + limit
+  const top = users.find({}).sort({ age: -1 }).limit(2).toArray();
+  assert.deepEqual(top.map((d) => d.age), [35, 30]);
+  const page2 = users.find({}).sort({ age: 1 }).skip(2).limit(2).toArray();
+  assert.deepEqual(page2.map((d) => d.age), [25, 30]);
+
+  // $or / $and / $in
+  assert.equal(users.find({ $or: [{ role: "admin" }, { age: { $lt: 15 } }] }).count(), 2);
+  assert.equal(users.find({ $and: [{ role: "user" }, { age: { $gte: 25 } }] }).count(), 2);
+  assert.equal(users.find({ name: { $in: ["ดำ", "แดง"] } }).count(), 2);
+  assert.equal(users.find({ name: { $regex: "^สม" } }).count(), 2);
+});
+
+test("Mongo: update operators ($set/$inc/$push/$unset) + dot notation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-upd-"));
+  const mdb = new Mongo(new XDB(join(dir, "app.xdb")));
+  const users = mdb.collection("users");
+
+  const { insertedId } = users.insertOne({
+    name: "สมชาย",
+    age: 30,
+    address: { city: "กรุงเทพ" },
+    tags: ["a"],
+  });
+
+  const r1 = users.updateOne({ _id: insertedId }, {
+    $set: { "address.city": "เชียงใหม่", status: "active" },
+    $inc: { age: 1 },
+    $push: { tags: "b" },
+  });
+  assert.deepEqual(r1, { matchedCount: 1, modifiedCount: 1 });
+
+  const doc = users.findById(insertedId)! as Record<string, any>;
+  assert.equal(doc.address.city, "เชียงใหม่");
+  assert.equal(doc.age, 31);
+  assert.deepEqual(doc.tags, ["a", "b"]);
+  assert.equal(doc.status, "active");
+
+  users.updateOne({ _id: insertedId }, { $unset: { status: true } });
+  assert.equal(users.findById(insertedId)?.status, undefined);
+
+  // updateMany
+  users.insertMany([{ n: 1, g: "x" }, { n: 2, g: "x" }, { n: 3, g: "y" }]);
+  const r2 = users.updateMany({ g: "x" }, { $inc: { n: 10 } });
+  assert.deepEqual(r2, { matchedCount: 2, modifiedCount: 2 });
+  assert.equal(users.find({ g: "x", n: 11 }).count(), 1);
+  assert.equal(users.find({ g: "x", n: 12 }).count(), 1);
+
+  // replace ทั้ง doc (ไม่มี $xxx)
+  users.updateOne({ n: 3 }, { hello: "world" } as unknown as import("./index.js").UpdateSpec);
+  assert.ok(users.findOne({ hello: "world" }) !== null);
+});
+
+test("Mongo: deleteOne / deleteMany / drop", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-del-"));
+  const mdb = new Mongo(new XDB(join(dir, "app.xdb")));
+  const logs = mdb.collection("logs");
+
+  logs.insertMany([
+    { level: "info", msg: "a" },
+    { level: "info", msg: "b" },
+    { level: "error", msg: "c" },
+  ]);
+
+  assert.deepEqual(logs.deleteOne({ level: "error" }), { deletedCount: 1 });
+  assert.equal(logs.countDocuments(), 2);
+  assert.deepEqual(logs.deleteMany({ level: "info" }), { deletedCount: 2 });
+  assert.equal(logs.countDocuments(), 0);
+
+  logs.insertOne({ x: 1 });
+  logs.insertOne({ x: 2 });
+  assert.deepEqual(logs.drop(), { deletedCount: 2 });
+  assert.equal(logs.countDocuments(), 0);
+});
+
+test("Mongo: persistence — ปิดแล้วเปิดใหม่ ข้อมูลครบ", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-persist-"));
+  const file = join(dir, "app.xdb");
+  {
+    const mdb = new Mongo(new XDB(file));
+    mdb.collection("users").insertMany([
+      { name: "อา", score: 10 },
+      { name: "บี", score: 20 },
+    ]);
+    mdb.close(); // เหลือไฟล์เดียว
+  }
+  {
+    const mdb = new Mongo(new XDB(file));
+    const users = mdb.collection("users");
+    assert.equal(users.countDocuments(), 2);
+    assert.equal(users.findOne({ name: "บี" })?.score, 20);
+    assert.equal(users.find({ score: { $gte: 15 } }).count(), 1);
+  }
+});
