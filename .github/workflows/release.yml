@@ -73,10 +73,12 @@ jobs:
           CPU_NAME="x64"
           if [[ "${{ matrix.npm_platform }}" == *arm64 ]]; then CPU_NAME="arm64"; fi
 
+          NODE_BASENAME=$(basename "$NODE_FILE" .node)
           cat > platform-pkg/package.json << EOF
           {
             "name": "@elitjs/xdb-${{ matrix.npm_platform }}",
             "version": "${{ github.ref_name }}",
+            "main": "$NODE_BASENAME.node",
             "os": ["$OS_NAME"],
             "cpu": ["$CPU_NAME"],
             "description": "x-db native addon for ${{ matrix.npm_platform }}",
