@@ -296,9 +296,10 @@ impl XDBStore {
         let _g = self.inner.write_lock.lock().unwrap();
         // ดัน memtable ลง layer ก่อน จะได้รวมข้อมูลทั้งหมด
         self.flush_locked()?;
-        if let Some((seq, merged_path, merged_reader, input_paths)) =
-            merge_all_layers(&self.inner)?
-        {
+        if let Some((seq, merged_path, merged_reader, input_paths)) = {
+            let n = self.inner.layers.read().unwrap().len();
+            merge_layers_range(&self.inner, 0, n)?
+        } {
             swap_layers_locked(&self.inner, seq, merged_path, merged_reader, &input_paths);
             for path in &input_paths {
                 let _ = std::fs::remove_file(path);
@@ -346,15 +347,49 @@ impl XDBStore {
     }
 }
 
-/// รวมทุก layers ปัจจุบันเป็นไฟล์เดียว (LZ4) — ขั้นตอน merge ไม่จับ lock เลย
+/// เลือกช่วง layers ที่ควรรว (tiered): กลุ่มใหม่สุดย้อนไปหาเก่า หยุดก่อนกลืน layer
+/// ที่ใหญ่กว่ากลุ่มสะสม 4 เท่า — layer base ตัวใหญ่จึงไม่โดน rewrite บ่อย ๆ
+/// คืน (start, end) ของช่วง หรือ None ถ้าไม่มีกลุ่มที่คุ้ม (ต้องมีอย่างน้อย 2 ตัว)
+/// ถ้า layers ล้น `hard_cap` จะรวทั้งหมดเลย (กันจำนวน layer บวมเกิน)
+fn pick_tier(layers: &[Layer], hard_cap: usize) -> Option<(usize, usize)> {
+    if layers.len() < 2 {
+        return None;
+    }
+    if layers.len() >= hard_cap {
+        return Some((0, layers.len()));
+    }
+    let mut group_count: u64 = 0;
+    let mut start = layers.len();
+    for i in (0..layers.len()).rev() {
+        let n = layers[i].reader.len();
+        // ตัวที่กำลังจะกลืนใหญ่กว่ากลุ่มที่สะสมไว้ 4 เท่า → ไม่กลืน (แพงเกินไป)
+        if start < layers.len() && n > group_count.saturating_mul(4) {
+            break;
+        }
+        group_count += n;
+        start = i;
+    }
+    if layers.len() - start >= 2 {
+        Some((start, layers.len()))
+    } else {
+        None
+    }
+}
+
+/// รวม layers ช่วง [start, end) เป็นไฟล์เดียว (LZ4) — ขั้นตอน merge ไม่จับ lock เลย
 /// (โหมด background รวนานเท่าไหร่ก็ได้ writer ไปต่อได้)
-/// คืน (seq ของ merged, path, reader, paths ของ inputs) หรือ None ถ้าไม่ต้องรว
-fn merge_all_layers(
+/// คืน (seq ของ merged, path, reader, paths ของ inputs) หรือ None ถ้าช่วงเล็กเกินไป
+fn merge_layers_range(
     inner: &StoreInner,
+    start: usize,
+    end: usize,
 ) -> io::Result<Option<(u64, PathBuf, Arc<XDBReader>, Vec<PathBuf>)>> {
     let current: Vec<(PathBuf, Arc<XDBReader>)> = {
         let layers = inner.layers.read().unwrap();
-        layers.iter().map(|l| (l.path.clone(), l.reader.clone())).collect()
+        if end - start <= 1 || end > layers.len() {
+            return Ok(None);
+        }
+        layers[start..end].iter().map(|l| (l.path.clone(), l.reader.clone())).collect()
     };
     if current.len() <= 1 {
         return Ok(None);
@@ -392,9 +427,16 @@ fn swap_layers_locked(
     layers.insert(insert_at, Layer { path: merged_path, reader: merged_reader });
 }
 
-/// รวม layers จนเบากว่า threshold — สำหรับ background thread
+/// รวน layers ตามนโยบาย tiered — สำหรับ background thread
 fn compact_layers_sync(inner: &StoreInner) -> io::Result<()> {
-    let Some((seq, merged_path, merged_reader, input_paths)) = merge_all_layers(inner)? else {
+    let (start, end) = {
+        let layers = inner.layers.read().unwrap();
+        // tiered ก่อน; ถ้าเลือกกลุ่มไม่ได้ (เช่นมีแค่ base ใหญ่ + layer เดียว) ให้รวทั้งหมด
+        pick_tier(&layers, inner.options.compact_threshold.max(2) * 2)
+            .unwrap_or((0, layers.len()))
+    };
+    let Some((seq, merged_path, merged_reader, input_paths)) = merge_layers_range(inner, start, end)?
+    else {
         return Ok(());
     };
     {

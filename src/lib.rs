@@ -1444,6 +1444,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn store_tiered_compaction_keeps_big_base_untouched() {
+        let dir = temp_store("tiered");
+        let opts = crate::store::StoreOptions {
+            compact_threshold: 8,
+            flush_entries: 1,
+            sync: true,
+        };
+        let store = XDBStore::open_opts(&dir, opts).unwrap();
+
+        // 1. base ใหญ่: 2000 entries ใน batch เดียว → layer เดียวขนาดใหญ่
+        let base: Vec<(Vec<u8>, Vec<u8>)> = (0..2000)
+            .map(|i| (format!("base:{i:05}").into_bytes(), format!("big-value-{i}").into_bytes()))
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = base.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        store.put(&refs).unwrap();
+        store.flush().unwrap();
+
+        // จดชื่อไฟล์ base ไว้
+        let base_file: std::path::PathBuf = {
+            let files: Vec<_> = std::fs::read_dir(&dir).unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("xdb"))
+                .collect();
+            assert_eq!(files.len(), 1, "หลัง flush ต้องมี layer เดียว: {files:?}");
+            files[0].clone()
+        };
+
+        // 2. เขียน layer เล็ก ๆ 10 ตัว (แต่ละตัว 1 entry) → เกิน threshold 8 → compact (tiered)
+        for i in 0..10u32 {
+            store.put(&[(format!("hot:{i:03}").as_bytes(), format!("small-{i}").as_bytes())]).unwrap();
+        }
+
+        // 3. รอ background compaction เสร็จ
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.is_compacting() {
+            assert!(std::time::Instant::now() < deadline, "background compaction ไม่จบ");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // 4. หัวใจของ test: base ยังอยู่ครบ (tiered รวเฉพาะกลุ่มเล็ก ไม่กลืน base ใหญ่)
+        assert!(base_file.exists(), "base layer ต้องไม่ถูก rewrite/ลบ: {base_file:?}");
+        let layer_count = store.layer_count();
+        // compaction หยุดเมื่อเบากว่า threshold (8) — put หลัง merge รอบสุดท้ายสะสมได้อีก
+        assert!(layer_count < 8, "layers ต้องต่ำกว่า threshold ได้ {layer_count}");
+
+        // 5. ข้อมูลครบทั้ง base และ hot
+        assert_eq!(store.get(b"base:00000").unwrap(), Some(b"big-value-0".to_vec()));
+        assert_eq!(store.get(b"base:01999").unwrap(), Some(b"big-value-1999".to_vec()));
+        for i in 0..10u32 {
+            assert_eq!(
+                store.get(format!("hot:{i:03}").as_bytes()).unwrap(),
+                Some(format!("small-{i}").into_bytes())
+            );
+        }
+
+        // 6. เปิดใหม่ก็ครบ
+        drop(store);
+        let store = XDBStore::open(&dir).unwrap();
+        assert_eq!(store.get(b"base:01000").unwrap(), Some(b"big-value-1000".to_vec()));
+        assert_eq!(store.get(b"hot:009").unwrap(), Some(b"small-9".to_vec()));
+    }
+
     /// แปลง String เป็น &'static [u8] เพื่อสร้าง slice ของ entries แบบ local (test เท่านั้น)
     fn leak(s: String) -> &'static [u8] {
         Box::leak(s.into_bytes().into_boxed_slice())

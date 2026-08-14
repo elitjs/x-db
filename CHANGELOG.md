@@ -2,6 +2,12 @@
 
 ## Unreleased (v0.3.0)
 
+### Tiered compaction — base ใหญ่ไม่โดน rewrite บ่อย ๆ
+- นโยบาย size-tiered: รวเฉพาะกลุ่ม layer เล็กล่าสุด หยุดก่อนกลืน layer ที่ใหญ่กว่ากลุ่ม 4 เท่า
+- ลด write amplification มหาศาลเมื่อ base ใหญ่ (ก่อนหน้า: rewrite ทั้งก้อนทุก 8 layers)
+- ถ้า layers ล้น 2x threshold → รวทั้งหมด (กันจำนวน layer บวม)
+- manual compact() ยังรวทั้งหมดเหมือนเดิม (เจตนาชัด = อยากได้ไฟล์เดียว)
+
 ### Background compaction — writer ไม่ต้องรอ merge อีกต่อไป
 - compaction รวเป็น layer เดียวใน **thread แยก** — put/delete ไม่โดน stall ตอน merge ตารางใหญ่
 - atomic flag กัน compaction ซ้อนกัน + วนรวจนเบากว่า threshold เอง
