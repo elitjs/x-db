@@ -609,6 +609,31 @@ test("XDB: set/get/update/delete บนไฟล์เดียว — ครบ
   }
 });
 
+test("XDB: add — counter แบบ INCRBY", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-unified-add-"));
+  const file = join(dir, "app.xdb");
+  const db = new XDB(file);
+
+  assert.equal(db.add("views", 1), 1);      // เริ่มที่ 0 → 1
+  assert.equal(db.add("views", 1), 2);
+  assert.equal(db.add("views", 10), 12);
+  assert.equal(db.add("views", -2), 10);    // ติดลบ = ลด
+  assert.equal(db.add("price", 1.5), 1.5);  // ทศนิยมได้
+  assert.equal(db.add("price", 0.5), 2);
+  assert.equal(db.get("views"), "10");
+  assert.equal(db.get("price"), "2");
+
+  // ค่าเดิมไม่ใช่ตัวเลข → throw ชัดเจน
+  db.set("text", "hello");
+  assert.throws(() => db.add("text", 1), /ไม่ใช่ตัวเลข/);
+  db.close();
+
+  // เปิดใหม่ — เลขยังอยู่ บวกต่อได้
+  const db2 = new XDB(file);
+  assert.equal(db2.add("views", 5), 15);
+  db2.close();
+});
+
 test("XDB: ไฟล์ที่ได้ใช้ร่วมกับ XDBReader / writeTable ecosystem ได้", () => {
   const dir = mkdtempSync(join(tmpdir(), "xdb-unified-interop-"));
   const file = join(dir, "app.xdb");
