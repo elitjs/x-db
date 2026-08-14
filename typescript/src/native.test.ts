@@ -785,3 +785,105 @@ test("Mongo: persistence — ปิดแล้วเปิดใหม่ ข�
     assert.equal(users.find({ score: { $gte: 15 } }).count(), 1);
   }
 });
+
+// ---------------- Update operations ครบชุด (MongoDB docs) ----------------
+
+test("Mongo: replaceOne — แทนที่ทั้ง doc + upsert", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-replace-"));
+  const db = new XDB(join(dir, "app.xdb"));
+  const users = db.collection("users");
+
+  const { insertedId } = users.insertOne({ name: "อา", age: 30, legacy: "โบราณ" });
+
+  // replace: field เก่าหายหมด (ต่างจาก $set)
+  const r = users.replaceOne({ _id: insertedId }, { name: "อาใหม่", level: 99 });
+  assert.deepEqual(r, { matchedCount: 1, modifiedCount: 1 });
+  const doc = users.findById(insertedId) as Record<string, any>;
+  assert.equal(doc.name, "อาใหม่");
+  assert.equal(doc.level, 99);
+  assert.equal(doc.legacy, undefined); // หายไปตาม semantics replace
+  assert.equal(doc.age, undefined);
+  assert.equal(doc._id, insertedId); // _id คงเดิม
+
+  // replaceOne ไม่เจ้า → upsert
+  const r2 = users.replaceOne({ name: "มาใหม่" }, { name: "มาใหม่", age: 20 }, { upsert: true });
+  assert.equal(r2.matchedCount, 0);
+  assert.ok(typeof r2.upsertedId === "string");
+  assert.equal((users.findById(r2.upsertedId!) as Record<string, any>).age, 20);
+  db.close();
+});
+
+test("Mongo: upsert ใน updateOne/updateMany + $setOnInsert", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-upsert-"));
+  const db = new XDB(join(dir, "app.xdb"));
+  const hits = db.collection("hits");
+
+  // ไม่เจอ + upsert → สร้างใหม่จาก filter seed + update
+  const r1 = hits.updateOne(
+    { page: "/home" },
+    { $inc: { count: 1 }, $setOnInsert: { createdAt: "2026-01-01" } },
+    { upsert: true },
+  );
+  assert.ok(r1.upsertedId);
+  const doc1 = hits.findById(r1.upsertedId!) as Record<string, any>;
+  assert.equal(doc1!.page, "/home"); // มาจาก filter
+  assert.equal(doc1.count, 1); // มาจาก $inc
+  assert.equal(doc1.createdAt, "2026-01-01"); // มาจาก $setOnInsert
+
+  // รอบสอง: เจอแล้ว → $setOnInsert ต้องไม่ทำงาน
+  hits.updateOne({ page: "/home" }, { $inc: { count: 1 }, $setOnInsert: { createdAt: "ห้ามเปลี่ยน" } }, { upsert: true });
+  const doc2 = hits.findOne({ page: "/home" }) as Record<string, any>;
+  assert.equal(doc2.count, 2);
+  assert.equal(doc2.createdAt, "2026-01-01");
+
+  // updateMany + upsert เมื่อไม่มีตัวตรงเลย
+  const r3 = hits.updateMany({ page: "/about" }, { $set: { page: "/about", n: 5 } }, { upsert: true });
+  assert.ok(r3.upsertedId);
+  assert.equal((hits.findOne({ page: "/about" }) as Record<string, any>).n, 5);
+  db.close();
+});
+
+test("Mongo: update operators เพิ่มเติม ($addToSet/$pull/$pop/$rename/$mul/$min/$max)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "xdb-mongo-upops-"));
+  const db = new XDB(join(dir, "app.xdb"));
+  const items = db.collection("items");
+  const { insertedId } = items.insertOne({
+    tags: ["a", "b"],
+    nums: [1, 5, 10],
+    score: 10,
+    oldName: "x",
+    best: 5,
+    worst: 5,
+  });
+
+  // $addToSet ต้องทำทีละตัว (key ซ้ำใน object เดียว JS ไม่รองรับ)
+  items.updateOne({ _id: insertedId }, { $addToSet: { tags: "b" } });
+  items.updateOne({ _id: insertedId }, { $addToSet: { tags: "c" } });
+  const d = () => items.findById(insertedId) as Record<string, any>;
+
+  assert.deepEqual(d().tags, ["a", "b", "c"]); // "b" ไม่ซ้ำ
+
+  items.updateOne({ _id: insertedId }, { $pull: { tags: "a" } });
+  assert.deepEqual(d().tags, ["b", "c"]);
+
+  items.updateOne({ _id: insertedId }, { $pull: { nums: { $gte: 5 } } }); // $pull + field-ops
+  assert.deepEqual(d().nums, [1]);
+
+  items.updateOne({ _id: insertedId }, { $pop: { nums: 1 } }); // เอาออกท้าย
+  assert.deepEqual(d().nums, []);
+
+  items.updateOne({ _id: insertedId }, { $rename: { oldName: "newName" } });
+  assert.equal(d().newName, "x");
+  assert.equal(d().oldName, undefined);
+
+  items.updateOne({ _id: insertedId }, { $mul: { score: 3 } });
+  assert.equal(d().score, 30);
+
+  items.updateOne({ _id: insertedId }, { $min: { best: 2 } }); // 2 < 5 → เปลี่ยน
+  items.updateOne({ _id: insertedId }, { $min: { best: 99 } }); // 99 > 2 → ไม่เปลี่ยน
+  items.updateOne({ _id: insertedId }, { $max: { worst: 8 } }); // 8 > 5 → เปลี่ยน
+  items.updateOne({ _id: insertedId }, { $max: { worst: 1 } }); // 1 < 8 → ไม่เปลี่ยน
+  assert.equal(d().best, 2);
+  assert.equal(d().worst, 8);
+  db.close();
+});

@@ -49,12 +49,26 @@ export interface FieldOps {
   $regex?: string | RegExp;
 }
 
-/** update แบบ MongoDB: $set / $unset / $inc / $push (ถ้าไม่มี $xxx = replace ทั้ง doc) */
+/** update แบบ MongoDB (ถ้าไม่มี $xxx = replace ทั้ง doc) */
 export interface UpdateSpec {
   $set?: Record<string, unknown>;
   $unset?: Record<string, true>;
   $inc?: Record<string, number>;
   $push?: Record<string, unknown>;
+  $addToSet?: Record<string, unknown>;
+  $pull?: Record<string, unknown>;
+  $pop?: Record<string, 1 | -1>;
+  $rename?: Record<string, string>;
+  $mul?: Record<string, number>;
+  $min?: Record<string, unknown>;
+  $max?: Record<string, unknown>;
+  $setOnInsert?: Record<string, unknown>;
+}
+
+/** ตัวเลือกของ update operations */
+export interface UpdateOptions {
+  /** ไม่เจอ = insert ให้ (ค่า field ที่เท่ากันใน filter + update กลายเป็น doc ใหม่) */
+  upsert?: boolean;
 }
 
 export type SortSpec = Record<string, 1 | -1>;
@@ -164,7 +178,19 @@ function matches(doc: MongoDoc, filter: Filter): boolean {
   return true;
 }
 
-function applyUpdate(doc: MongoDoc, update: UpdateSpec): MongoDoc {
+/** ดึง path เป็น array (ไม่ใช่ array = เริ่มใหม่) — ใช้กับ $push/$addToSet */
+function asArray(doc: MongoDoc, path: string): unknown[] {
+  const cur = getPath(doc, path);
+  return Array.isArray(cur) ? [...cur] : [];
+}
+
+/** $pull: condition เป็น field-ops ก็กรองตาม ops ได้ (subset ของ MongoDB) */
+function pullMatches(item: unknown, cond: unknown): boolean {
+  if (isFieldOps(cond)) return matchOps(item, cond);
+  return deepEq(item, cond);
+}
+
+function applyUpdate(doc: MongoDoc, update: UpdateSpec, isInsert = false): MongoDoc {
   const hasOps = Object.keys(update).some((k) => k.startsWith("$"));
   if (!hasOps) {
     // ไม่มี $xxx = replace ทั้ง doc (คง _id เดิมตาม semantics ของ MongoDB)
@@ -182,16 +208,78 @@ function applyUpdate(doc: MongoDoc, update: UpdateSpec): MongoDoc {
       case "$inc":
         for (const [p, d] of Object.entries(spec as Record<string, number>)) {
           const cur = getPath(next, p);
-          if (typeof cur !== "number") throw new Error(`Mongo $inc: \`${p}\` ไม่ใช่ตัวเลข`);
-          setPath(next, p, cur + d);
+          // field ที่ยังไม่มี = 0 (ตาม semantics MongoDB — สำคัญตอน upsert)
+          if (cur !== undefined && typeof cur !== "number") {
+            throw new Error(`Mongo $inc: \`${p}\` ไม่ใช่ตัวเลข`);
+          }
+          setPath(next, p, (typeof cur === "number" ? cur : 0) + d);
         }
         break;
       case "$push": {
         for (const [p, v] of Object.entries(spec as Record<string, unknown>)) {
-          const cur = getPath(next, p);
-          const arr = Array.isArray(cur) ? cur : [];
+          const arr = asArray(next, p);
           arr.push(v);
           setPath(next, p, arr);
+        }
+        break;
+      }
+      case "$setOnInsert": {
+        if (!isInsert) break;
+        for (const [p, v] of Object.entries(spec as Record<string, unknown>)) setPath(next, p, v);
+        break;
+      }
+      case "$addToSet": {
+        for (const [p, v] of Object.entries(spec as Record<string, unknown>)) {
+          const arr = asArray(next, p);
+          if (!arr.some((x) => deepEq(x, v))) arr.push(v);
+          setPath(next, p, arr);
+        }
+        break;
+      }
+      case "$pull": {
+        for (const [p, v] of Object.entries(spec as Record<string, unknown>)) {
+          const cur = getPath(next, p);
+          if (!Array.isArray(cur)) continue;
+          setPath(next, p, cur.filter((x) => !pullMatches(x, v)));
+        }
+        break;
+      }
+      case "$pop": {
+        for (const [p, dir] of Object.entries(spec as Record<string, 1 | -1>)) {
+          const cur = getPath(next, p);
+          if (!Array.isArray(cur) || cur.length === 0) continue;
+          setPath(next, p, dir === -1 ? cur.slice(1) : cur.slice(0, -1));
+        }
+        break;
+      }
+      case "$rename": {
+        for (const [from, to] of Object.entries(spec as Record<string, string>)) {
+          const v = getPath(next, from);
+          if (v === undefined) continue;
+          delPath(next, from);
+          setPath(next, to, v);
+        }
+        break;
+      }
+      case "$mul": {
+        for (const [p, m] of Object.entries(spec as Record<string, number>)) {
+          const cur = getPath(next, p);
+          if (typeof cur !== "number") throw new Error(`Mongo $mul: \`${p}\` ไม่ใช่ตัวเลข`);
+          setPath(next, p, cur * m);
+        }
+        break;
+      }
+      case "$min": {
+        for (const [p, v] of Object.entries(spec as Record<string, unknown>)) {
+          const cur = getPath(next, p);
+          if (cur === undefined || (cmp(cur, v) ?? 0) > 0) setPath(next, p, v);
+        }
+        break;
+      }
+      case "$max": {
+        for (const [p, v] of Object.entries(spec as Record<string, unknown>)) {
+          const cur = getPath(next, p);
+          if (cur === undefined || (cmp(cur, v) ?? 0) < 0) setPath(next, p, v);
         }
         break;
       }
@@ -378,17 +466,26 @@ export class Collection<T extends MongoDoc = MongoDoc> {
 
   // ── update ──
 
-  updateOne(filter: Filter, update: UpdateSpec): { matchedCount: number; modifiedCount: number } {
+  updateOne(
+    filter: Filter,
+    update: UpdateSpec,
+    options: UpdateOptions = {},
+  ): { matchedCount: number; modifiedCount: number; upsertedId?: string } {
     for (const { key: id, value } of this.#docIter()) {
       if (!matches(value as T, filter)) continue;
       const updated = applyUpdate(value as T, update);
       this.#db.set(this.#keyOf(id), updated as unknown as XDBValue);
       return { matchedCount: 1, modifiedCount: 1 };
     }
+    if (options.upsert) return { matchedCount: 0, modifiedCount: 0, ...this.#upsert(filter, update) };
     return { matchedCount: 0, modifiedCount: 0 };
   }
 
-  updateMany(filter: Filter, update: UpdateSpec): { matchedCount: number; modifiedCount: number } {
+  updateMany(
+    filter: Filter,
+    update: UpdateSpec,
+    options: UpdateOptions = {},
+  ): { matchedCount: number; modifiedCount: number; upsertedId?: string } {
     let matched = 0;
     const updated: Array<[string, XDBValue]> = [];
     for (const { key: id, value } of this.#docIter()) {
@@ -397,7 +494,38 @@ export class Collection<T extends MongoDoc = MongoDoc> {
       updated.push([this.#keyOf(id), applyUpdate(value as T, update) as unknown as XDBValue]);
     }
     if (updated.length > 0) this.#db.setMany(updated);
+    if (matched === 0 && options.upsert) {
+      return { matchedCount: 0, modifiedCount: 0, ...this.#upsert(filter, update) };
+    }
     return { matchedCount: matched, modifiedCount: matched };
+  }
+
+  /** แทนที่ทั้ง doc (ต่างจาก update = ไม่สน operators) — คง _id เดิม */
+  replaceOne(
+    filter: Filter,
+    doc: Record<string, unknown>,
+    options: UpdateOptions = {},
+  ): { matchedCount: number; modifiedCount: number; upsertedId?: string } {
+    for (const { key: id, value } of this.#docIter()) {
+      if (!matches(value as T, filter)) continue;
+      this.#db.set(this.#keyOf(id), { ...doc, _id: id } as unknown as XDBValue);
+      return { matchedCount: 1, modifiedCount: 1 };
+    }
+    if (options.upsert) {
+      return { matchedCount: 0, modifiedCount: 0, ...this.#upsert(filter, { $set: doc }) };
+    }
+    return { matchedCount: 0, modifiedCount: 0 };
+  }
+
+  /** upsert: สร้าง doc ใหม่จาก field ที่เท่ากันใน filter + update (ตาม semantics MongoDB) */
+  #upsert(filter: Filter, update: UpdateSpec): { upsertedId: string } {
+    const seed: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(filter)) {
+      if (k.startsWith("$")) continue;
+      if (!isFieldOps(v)) seed[k] = v; // field-ops/$regex ฯลฯ ข้าม (แบบ MongoDB)
+    }
+    const doc = applyUpdate({ ...seed } as MongoDoc, update, true);
+    return { upsertedId: this.insertOne(doc).insertedId };
   }
 
   // ── delete ──
