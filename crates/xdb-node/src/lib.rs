@@ -281,8 +281,7 @@ impl XdbStore {
   #[napi]
   pub fn put(&self, entries: Vec<Entry>) -> Result<()> {
     let pairs = normalize_sorted(entries);
-    let refs: Vec<(&[u8], &[u8])> = pairs.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
-    self.inner()?.put(&refs).map_err(io_err)
+    self.inner()?.put_owned(pairs).map_err(io_err)
   }
 
   /// ลบ keys — เขียน tombstone กดค่าใน layer เก่า

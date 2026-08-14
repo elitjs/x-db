@@ -179,6 +179,15 @@ impl XDBStore {
         self.write_batch(batch)
     }
 
+    /// เหมือน `put` แต่รับ owned entries — ประหยัดการ copy หนึ่งรอบ (ใช้จาก binding)
+    pub fn put_owned(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> io::Result<()> {
+        let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+            entries.into_iter().map(|(k, v)| (k, Some(v))).collect();
+        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        batch.dedup_by(|a, b| a.0 == b.0);
+        self.write_batch(batch)
+    }
+
     /// ลบ keys — เขียน tombstone ลง WAL + memtable กดค่าเก่า
     pub fn delete(&self, keys: &[&[u8]]) -> io::Result<()> {
         let mut batch: Vec<(Vec<u8>, Option<Vec<u8>>)> =
@@ -195,9 +204,10 @@ impl XDBStore {
             let _g = self.inner.write_lock.lock().unwrap();
             self.inner.wal.lock().unwrap().append(&batch)?;
             {
+                // move เข้า memtable เลย — batch เป็นเจ้าของ owned อยู่แล้ว ไม่ต้อง clone
                 let mut mem = self.inner.memtable.write().unwrap();
-                for (k, v) in &batch {
-                    mem.insert(k.clone(), v.clone());
+                for (k, v) in batch {
+                    mem.insert(k, v);
                 }
             }
             if self.inner.options.flush_entries > 0
@@ -245,21 +255,45 @@ impl XDBStore {
 
     /// flush โดยถือ write_lock อยู่แล้ว
     fn flush_locked(&self) -> io::Result<()> {
-        let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = {
-            let mem = self.inner.memtable.read().unwrap();
-            mem.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-        };
-        if entries.is_empty() {
+        // ยึด memtable ทั้งก้อนไปเลย (take) — ไม่ clone หลายพัน entries
+        let taken = { std::mem::take(&mut *self.inner.memtable.write().unwrap()) };
+        if taken.is_empty() {
             return Ok(());
         }
 
-        // เขียน layer ก่อน (durable) — ถ้าพังกลางทาง WAL ยังอยู่ ไม่เสียข้อมูล
+        match self.write_memtable_layer(&taken) {
+            Ok((final_path, reader)) => {
+                // push layer (write_lock ครอบอยู่แล้ว ไม่มี writer แทรก จึงสลับได้อย่างปลอดภัย)
+                {
+                    let mut layers = self.inner.layers.write().unwrap();
+                    layers.push(Layer { path: final_path, reader });
+                }
+                // layer ถาวรแล้ว → ล้าง WAL ได้
+                self.inner.wal.lock().unwrap().reset()?;
+                Ok(())
+            }
+            Err(e) => {
+                // เขียน layer พัง — คืน entries กลับเข้า memtable ก่อนแจ้ง error (ไม่เสียข้อมูล)
+                let mut mem = self.inner.memtable.write().unwrap();
+                for (k, v) in taken {
+                    mem.insert(k, v);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// เขียน memtable เป็น layer ใหม่แบบ atomic (tmp + rename + fsync)
+    fn write_memtable_layer(
+        &self,
+        mem: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    ) -> io::Result<(PathBuf, Arc<XDBReader>)> {
         let seq = self.inner.next_seq.fetch_add(1, Ordering::SeqCst);
         let final_path = self.inner.dir.join(format!("{seq:06}.xdb"));
         let tmp = final_path.with_extension("xdb.tmp");
         {
-            let mut b = TableBuilder::create(&tmp, entries.len())?;
-            for (k, v) in &entries {
+            let mut b = TableBuilder::create(&tmp, mem.len())?;
+            for (k, v) in mem {
                 match v {
                     Some(v) => b.add(k, v)?,
                     None => b.add_tombstone(k)?,
@@ -272,22 +306,7 @@ impl XDBStore {
         }
         std::fs::rename(&tmp, &final_path)?;
         let reader = Arc::new(XDBReader::open(&final_path)?);
-
-        // สลับแบบ atomic ต่อ reader: push layer + clear memtable ใน critical section เดียว
-        // (กัน reader ที่เห็น memtable ว่างแต่ layer ยังไม่ขึ้น)
-        {
-            let mut mem = self.inner.memtable.write().unwrap();
-            let mut layers = self.inner.layers.write().unwrap();
-            // เก็บเฉพาะ entries ที่เข้าใหม่ระหว่างเขียน layer (BTreeMap ทำให้ range ง่าย)
-            layers.push(Layer { path: final_path, reader });
-            mem.clear();
-            // หมายเหตุ: ถ้ามี put ใหม่ระหว่าง flush มันถูก serialize โดย write_lock อยู่แล้ว
-            // (flush_locked ถูกเรียกใต้ write_lock เสมอ) จึงไม่มี entry หลุด
-        }
-
-        // layer ถาวรแล้ว → ล้าง WAL ได้
-        self.inner.wal.lock().unwrap().reset()?;
-        Ok(())
+        Ok((final_path, reader))
     }
 
     /// รวมทุก layers เป็นไฟล์เดียว — คืนค่าจำนวน layers หลัง compact

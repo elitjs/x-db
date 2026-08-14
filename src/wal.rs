@@ -21,6 +21,8 @@ pub struct Wal {
     file: File,
     path: PathBuf,
     sync: bool,
+    /// buffer reuse ระหว่าง append รอบ (ไม่ allocate ใหม่ทุก batch)
+    buf: Vec<u8>,
 }
 
 impl Wal {
@@ -71,7 +73,7 @@ impl Wal {
         file.seek(SeekFrom::End(0))?;
 
         Ok((
-            Self { file, path: path.to_path_buf(), sync },
+            Self { file, path: path.to_path_buf(), sync, buf: Vec::new() },
             entries,
         ))
     }
@@ -81,21 +83,30 @@ impl Wal {
         if batch.is_empty() {
             return Ok(());
         }
-        let mut buf = Vec::with_capacity(batch.len() * 32);
+        // เขียนทุก records ลง buffer เดียว (reserve ครั้งเดียว ไม่มี per-record allocation)
+        let buf = &mut self.buf;
+        buf.clear();
+        let mut size = 0usize;
+        for (key, value) in batch {
+            size += 4 + RECORD_HEADER + key.len() + value.as_ref().map_or(0, |v| v.len());
+        }
+        buf.reserve(size);
         for (key, value) in batch {
             let (val_bytes, v_raw): (&[u8], u32) = match value {
                 Some(v) => (v.as_slice(), v.len() as u32),
                 None => (&[], TOMBSTONE_FLAG),
             };
-            let mut rec = Vec::with_capacity(RECORD_HEADER + key.len() + val_bytes.len());
-            rec.extend_from_slice(&(key.len() as u16).to_be_bytes());
-            rec.extend_from_slice(&v_raw.to_be_bytes());
-            rec.extend_from_slice(key);
-            rec.extend_from_slice(val_bytes);
-            buf.extend_from_slice(&crc32(&rec).to_be_bytes());
-            buf.extend_from_slice(&rec);
+            let crc_slot = buf.len();
+            buf.extend_from_slice(&[0u8; 4]); // ที่ว่าสำหรับ crc — เติมทีหลัง
+            let rec_start = buf.len();
+            buf.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            buf.extend_from_slice(&v_raw.to_be_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(val_bytes);
+            let crc = crc32(&buf[rec_start..]);
+            buf[crc_slot..crc_slot + 4].copy_from_slice(&crc.to_be_bytes());
         }
-        self.file.write_all(&buf)?;
+        self.file.write_all(buf)?;
         if self.sync {
             self.file.sync_data()?;
         }
@@ -103,10 +114,13 @@ impl Wal {
     }
 
     /// ล้าง WAL (หลัง memtable ถูก flush เป็น layer ถาวรแล้ว)
+    /// fsync เฉพาะโหมด sync — nosync ไม่จำเป็น (layer เอง fsync แล้ว)
     pub fn reset(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.sync_data()?;
+        if self.sync {
+            self.file.sync_data()?;
+        }
         Ok(())
     }
 
