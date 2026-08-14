@@ -150,7 +150,6 @@ db.get("user:1");        // { name: "สมชาย", age: 30 } — ถอด J
 db.getBytes("note");      // อยากได้ bytes ดิบ
 db.has("note");           // true
 db.set("user:1", { name: "สมชาย", age: 31 });         // update บนไฟล์เดียวกัน
-db.add("views", 1);       // ★ counter แบบ INCRBY — บวกเข้า key (เริ่มที่ 0) คืนค่าใหม่
 db.del("note", "a");      // ลบกี่ตัวก็ได้
 
 for (const e of db.prefix("user:")) { /* ไล่/ช่วง/seek ครบ */ }
@@ -169,7 +168,6 @@ let db = XDB::open("app.xdb")?;                     // หรือ open_with(pa
 db.set("user:1", "สมชาย")?;                          // &str หรือ &[u8] ก็ได้
 db.set_many(&[("a", "1"), ("b", "2")])?;
 db.get_utf8("user:1")?;                              // Some("สมชาย")
-db.add("views", 1)?;                                // counter แบบ INCRBY (คืนค่าใหม่)
 db.del(&["a", "b"])?;
 for entry in db.prefix(b"user:") { let (_k, _v) = entry?; }
 db.save()?;                                           // atomic — reader เก่าไม่พัง

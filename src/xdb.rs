@@ -109,24 +109,6 @@ impl XDB {
         self.sf.has(key.as_ref())
     }
 
-    /// บวกค่าตัวเลขเข้า key (แบบ INCRBY ของ Redis) — ถ้า key ไม่มีเริ่มที่ 0
-    /// คืนค่าใหม่หลังบวก (delta ติดลบ = ลด) / Err ถ้าค่าเดิมไม่ใช่ตัวเลข
-    pub fn add<K: AsRef<[u8]>>(&self, key: K, delta: f64) -> io::Result<f64> {
-        let current: f64 = match self.sf.get(key.as_ref())? {
-            Some(v) => String::from_utf8(v)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "x-db add: existing value is not a number")
-                })?,
-            None => 0.0,
-        };
-        let next = current + delta;
-        let s = format!("{next}");
-        self.sf.put(&[(key.as_ref(), s.as_bytes())])?;
-        Ok(next)
-    }
-
     /// ลบหลาย key ในคำสั่งเดียว
     pub fn del<K: AsRef<[u8]>>(&self, keys: &[K]) -> io::Result<()> {
         let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();

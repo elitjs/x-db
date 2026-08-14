@@ -1637,32 +1637,6 @@ mod tests {
     }
 
     #[test]
-    fn xdb_add_counter_semantics() {
-        let path = temp_xdb("add");
-        let db = XDB::open(&path).unwrap();
-
-        assert_eq!(db.add("views", 1.0).unwrap(), 1.0);       // เริ่มที่ 0 → 1
-        assert_eq!(db.add("views", 1.0).unwrap(), 2.0);
-        assert_eq!(db.add("views", 10.0).unwrap(), 12.0);
-        assert_eq!(db.add("views", -2.0).unwrap(), 10.0);      // ติดลบ = ลด
-        assert_eq!(db.add("price", 1.5).unwrap(), 1.5);      // ทศนิยมได้
-        assert_eq!(db.add("price", 0.5).unwrap(), 2.0);
-        assert_eq!(db.get_utf8("views").unwrap(), Some("10".to_string()));
-        assert_eq!(db.get_utf8("price").unwrap(), Some("2".to_string()));
-
-        // ค่าเดิมไม่ใช่ตัวเลข → error ชัดเจน
-        db.set("text", "hello").unwrap();
-        let err = db.add("text", 1.0).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        db.close().unwrap();
-
-        // เปิดใหม่ — เลขยังอยู่ บวกต่อได้
-        let db2 = XDB::open(&path).unwrap();
-        assert_eq!(db2.add("views", 5.0).unwrap(), 15.0);
-        db2.close().unwrap();
-    }
-
-    #[test]
     fn xdb_interop_with_writer_and_reader() {
         let path = temp_xdb("interop");
         // สร้างด้วย write_table เดิม → XDB เปิดแก้ต่อได้

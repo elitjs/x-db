@@ -673,23 +673,6 @@ export class XDB {
     return this.#sf.has(key);
   }
 
-  /**
-   * บวกค่าตัวเลขเข้า key (แบบ INCRBY ของ Redis) — ถ้า key ไม่มีเริ่มที่ 0
-   * คืนค่าใหม่หลังบวก (delta ติดลบ = ลด)
-   * @throws ถ้าค่าเดิมไม่ใช่ตัวเลข
-   */
-  add(key: KeyValue, delta: number): number {
-    const raw = this.#sf.get(key);
-    const current =
-      raw === null ? 0 : Number(new TextDecoder().decode(raw));
-    if (!Number.isFinite(current)) {
-      throw new Error(`x-db add: ค่าเดิมของ key นี้ไม่ใช่ตัวเลข`);
-    }
-    const next = current + delta;
-    this.#sf.put([[key, String(next)] as [KeyValue, string]]);
-    return next;
-  }
-
   /** ลบ — รับกี่ key ก็ได้: del("a") หรือ del("a", "b", "c") */
   del(...keys: KeyValue[]): void {
     if (keys.length === 0) return;
