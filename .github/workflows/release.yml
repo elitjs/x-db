@@ -83,10 +83,11 @@ jobs:
       - name: Assemble package
         run: |
           mkdir -p typescript/dist typescript/prebuilds
-          cp -f artifacts/*/x-db.cjs typescript/
-          cp -f artifacts/*/x-db.d.ts typescript/
-          cp -rf artifacts/*/dist/* typescript/dist/
-          cp artifacts/*/*.node typescript/prebuilds/ 2>/dev/null || true
+          FIRST=$(ls artifacts/ | head -1)
+          cp artifacts/$FIRST/x-db.cjs typescript/
+          cp artifacts/$FIRST/x-db.d.ts typescript/
+          cp -r artifacts/$FIRST/dist/* typescript/dist/
+          for d in artifacts/*/; do cp $d*.node typescript/prebuilds/ 2>/dev/null || true; done
           ls -la typescript/ typescript/prebuilds/
 
       - name: Publish
