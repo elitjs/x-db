@@ -2,6 +2,11 @@
 
 ## Unreleased (v0.3.0)
 
+### Periodic sync — คุมช่องเสียข้อมูลตอนไฟดับของโหมด nosync
+- `StoreOptions.sync_interval_ms` (TS: `syncIntervalMs`): เมื่อ sync=false จะมี background thread
+  fsync WAL ทุก N ms → put ยังเร็วเท่าเดิม แต่เสียข้อมูลตอนไฟดับได้สูงสุดแค่ N ms (เดิม: ไม่จำกัด)
+- teardown เร็ว: ตอน drop/close store, thread ถูกปลุกให้ออกทันทีด้วย condvar (file lock ปลดเร็ว)
+
 ### Batch write optimization
 - WAL append: single reusable buffer (no per-record allocation)
 - write path: move batch into memtable instead of cloning every entry

@@ -219,6 +219,9 @@ pub struct StoreOptions {
   pub flush_entries: Option<u32>,
   /// fsync WAL ทุก put (default true) — false = เร็วขึ้นแต่พังกลางทางอาจเสีย put ล่าสุด
   pub sync: Option<bool>,
+  /// (เมื่อ sync=false) fsync WAL เป็นระยะทุก N ms → เสียข้อมูลตอนไฟดับได้สูงสุดแค่ N ms
+  /// 0 = ปิด / แนะนำ 100-1000
+  pub sync_interval_ms: Option<u32>,
 }
 
 fn closed_err() -> Error {
@@ -235,6 +238,7 @@ impl XdbStore {
       if let Some(t) = o.compact_threshold { s.compact_threshold = t as usize; }
       if let Some(f) = o.flush_entries { s.flush_entries = f as usize; }
       if let Some(sync) = o.sync { s.sync = sync; }
+      if let Some(ms) = o.sync_interval_ms { s.sync_interval_ms = ms as u64; }
       s
     }).unwrap_or_default();
     InnerStore::open_opts(&path, opts)

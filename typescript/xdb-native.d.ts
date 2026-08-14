@@ -29,6 +29,11 @@ export interface StoreOptions {
   flushEntries?: number
   /** fsync WAL ทиก put (default true) — false = เรчวขжщนแตшพбงกลางทางอาจเสеย put ลшาสиด */
   sync?: boolean
+  /**
+   * (เมзшอ sync=false) fsync WAL เปчนระยะทиก N ms → เสеยขщอมйลตอนไฟดбบไดщสйงสиดแคш N ms
+   * 0 = ปдด / แนะนำ 100-1000
+   */
+  syncIntervalMs?: number
 }
 /** entry จาก store iterator (ตбด tombstone ออกแลщว) */
 export interface StoreEntry {

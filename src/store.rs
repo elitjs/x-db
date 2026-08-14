@@ -15,7 +15,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 /// จำนวน layers ที่ทำให้ compact อัตโนมัติ (0 = ปิด)
 pub const DEFAULT_COMPACT_THRESHOLD: usize = 8;
@@ -30,6 +30,10 @@ pub struct StoreOptions {
     pub flush_entries: usize,
     /// fsync WAL ทุก put (default true) — false = เร็วขึ้นแต่ถ้าไฟดัน/พัง อาจเสีย put ล่าสุด
     pub sync: bool,
+    /// (ใช้เมื่อ sync = false) fsync WAL เป็นระยะทุก N ms โดย background thread
+    /// → put ยังเร็วเหมือน nosync แต่ช่องเสียข้อมูลตอนไฟดับถูกจำกัดไว้ ≤ N ms
+    /// 0 = ปิด (nosync แบบเดิม) / แนะนำ 100-1000ms
+    pub sync_interval_ms: u64,
 }
 
 impl Default for StoreOptions {
@@ -38,6 +42,7 @@ impl Default for StoreOptions {
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             flush_entries: DEFAULT_FLUSH_ENTRIES,
             sync: true,
+            sync_interval_ms: 0,
         }
     }
 }
@@ -60,6 +65,10 @@ struct StoreInner {
     options: StoreOptions,
     /// กัน compact ซ้อนกัน (true = มี background compaction กำลังรว)
     compacting: AtomicBool,
+    /// สัญญาณหยุดสำหรับ periodic-sync thread (ตื่นทันทีตอน drop ไม่ต้องรอครบรอบ)
+    stop_flag: AtomicBool,
+    sync_wait: Mutex<()>,
+    sync_notifier: Condvar,
     /// ถือ exclusive lock ไว้ตลอดอายุ store — กันอีก process (หรือ instance) เปิด dir เดียวกัน
     _lock_file: File,
 }
@@ -118,19 +127,28 @@ impl XDBStore {
         let memtable: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
             wal_entries.into_iter().collect();
 
-        Ok(Self {
-            inner: Arc::new(StoreInner {
-                dir: dir.as_ref().to_path_buf(),
-                layers: RwLock::new(layers),
-                memtable: RwLock::new(memtable),
-                wal: Mutex::new(wal),
-                write_lock: Mutex::new(()),
-                next_seq: AtomicU64::new(max_seq + 1),
-                options,
-                compacting: AtomicBool::new(false),
-                _lock_file: lock_file,
-            }),
-        })
+        let inner = Arc::new(StoreInner {
+            dir: dir.as_ref().to_path_buf(),
+            layers: RwLock::new(layers),
+            memtable: RwLock::new(memtable),
+            wal: Mutex::new(wal),
+            write_lock: Mutex::new(()),
+            next_seq: AtomicU64::new(max_seq + 1),
+            options,
+            compacting: AtomicBool::new(false),
+            stop_flag: AtomicBool::new(false),
+            sync_wait: Mutex::new(()),
+            sync_notifier: Condvar::new(),
+            _lock_file: lock_file,
+        });
+
+        // nosync + sync_interval_ms > 0 → เปิด periodic sync thread
+        // (จำกัดช่องเสียข้อมูลตอนไฟดับไว้ ≤ sync_interval_ms โดยไม่ทำให้ put ช้าลง)
+        if !inner.options.sync && inner.options.sync_interval_ms > 0 {
+            spawn_periodic_sync(Arc::downgrade(&inner), inner.options.sync_interval_ms);
+        }
+
+        Ok(Self { inner })
     }
 
     /// จำนวน layers ปัจจุบัน
@@ -363,6 +381,44 @@ impl XDBStore {
         let p = prefix.to_vec();
         self.iter_from(prefix)
             .take_while(move |r| matches!(r, Ok((k, _)) if k.starts_with(&p)))
+    }
+}
+
+/// Background thread: ทุก sync_interval_ms → fsync WAL (โหมด nosync)
+/// ใช้ Weak — เมื่อ store ถูก drop หมด thread ออกเอง และปลุกให้ออกทันทีด้วย condvar
+fn spawn_periodic_sync(weak: Weak<StoreInner>, interval_ms: u64) {
+    std::thread::spawn(move || {
+        let interval = std::time::Duration::from_millis(interval_ms);
+        loop {
+            // รอครบรอบ หรือโดนปลุกให้หยุด (ถือ strong เฉพาะตอนรอ)
+            {
+                let inner = match weak.upgrade() {
+                    Some(i) => i,
+                    None => break,
+                };
+                if inner.stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let g = inner.sync_wait.lock().unwrap();
+                let _ = inner.sync_notifier.wait_timeout(g, interval).unwrap();
+            }
+            // ตื่นเพราะครบรอบ → sync WAL (upgrade สั้น ๆ เฉพาะตอนทำงาน)
+            if let Some(inner) = weak.upgrade() {
+                if !inner.stop_flag.load(Ordering::Relaxed) {
+                    if let Ok(mut wal) = inner.wal.lock() {
+                        let _ = wal.sync_periodic();
+                    }
+                }
+            }
+        }
+    });
+}
+
+impl Drop for XDBStore {
+    fn drop(&mut self) {
+        // ปลุก periodic-sync thread ให้ออกทันที (ไม่ต้องรอครบ interval → ปลด file lock เร็ว)
+        self.inner.stop_flag.store(true, Ordering::Relaxed);
+        self.inner.sync_notifier.notify_all();
     }
 }
 

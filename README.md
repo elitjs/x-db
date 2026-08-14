@@ -134,8 +134,10 @@ delete = tombstone, และ **compact อัตโนมัติแบบ bac
 import { XdbStore } from "xdb-native";
 
 const store = new XdbStore("./mydata");          // directory (สร้างให้เอง)
-// ตัวเลือก: { compactThreshold: 8, flushEntries: 4096, sync: true }
-// sync: false = เร็วขึ้น (ไม่ fsync ทุก put) แต่ process พังกลางทางอาจเสีย put ล่าสุด
+// ตัวเลือก: { compactThreshold: 8, flushEntries: 4096, sync: true, syncIntervalMs: 0 }
+// sync: true  = fsync ทุก put (~1ms) — ไฟดับก็ไม่เสียข้อมูล
+// sync: false = เร็วมาก (~5µs) แต่ไฟดับอาจเสีย put ท้ายสุด → ใช้ syncIntervalMs คุมช่องเสีย
+//   เช่น { sync: false, syncIntervalMs: 200 } = put เร็วเท่าเดิม เสียได้สูงสุดแค่ 200ms ตอนไฟดับ
 
 store.put([["alice", "engineer"]]);               // insert
 store.put([["alice", "senior engineer"]]);        // update — ทันที

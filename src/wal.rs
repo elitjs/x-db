@@ -113,6 +113,15 @@ impl Wal {
         Ok(())
     }
 
+    /// fsync เฉพาะเมื่ออยู่โหมด nosync (โหมด sync ทำแล้วทุก append)
+    /// เรียกจาก background periodic-sync thread
+    pub fn sync_periodic(&mut self) -> io::Result<()> {
+        if !self.sync {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+
     /// ล้าง WAL (หลัง memtable ถูก flush เป็น layer ถาวรแล้ว)
     /// fsync เฉพาะโหมด sync — nosync ไม่จำเป็น (layer เอง fsync แล้ว)
     pub fn reset(&mut self) -> io::Result<()> {

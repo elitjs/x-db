@@ -74,6 +74,8 @@ export interface XdbStoreOptions {
   flushEntries?: number;
   /** fsync WAL ทุก put (default true) — false = เร็วขึ้นแต่ process พังกลางทางอาจเสีย put ล่าสุด */
   sync?: boolean;
+  /** (เมื่อ sync=false) fsync WAL เป็นระยะทุก N ms → เสียข้อมูลตอนไฟดับได้สูงสุดแค่ N ms (0 = ปิด) */
+  syncIntervalMs?: number;
 }
 
 interface NativeApi {
@@ -83,7 +85,7 @@ interface NativeApi {
   XdbReader: new (path: string) => NativeReader;
   XdbStore: new (
     path: string,
-    options?: { compactThreshold?: number; flushEntries?: number; sync?: boolean },
+    options?: { compactThreshold?: number; flushEntries?: number; sync?: boolean; syncIntervalMs?: number },
   ) => NativeStore;
 }
 

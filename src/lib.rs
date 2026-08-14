@@ -1370,6 +1370,7 @@ mod tests {
             compact_threshold: 4,
             flush_entries: 1, // ทุก put flush เป็น layer ทันที (เพื่อทดสอบ threshold)
             sync: true,
+        sync_interval_ms: 0,
         };
         let store = XDBStore::open_opts(&dir, opts).unwrap();
         for i in 0..3 {
@@ -1395,6 +1396,7 @@ mod tests {
             compact_threshold: 4,
             flush_entries: 1,
             sync: true,
+        sync_interval_ms: 0,
         };
         let store = XDBStore::open_opts(&dir, opts).unwrap();
 
@@ -1451,6 +1453,7 @@ mod tests {
             compact_threshold: 8,
             flush_entries: 1,
             sync: true,
+        sync_interval_ms: 0,
         };
         let store = XDBStore::open_opts(&dir, opts).unwrap();
 
@@ -1672,6 +1675,7 @@ mod tests {
             compact_threshold: 0,
             flush_entries: 5,
             sync: true,
+        sync_interval_ms: 0,
         };
         let store = XDBStore::open_opts(&dir, opts).unwrap();
         for i in 0..4 {
@@ -1723,6 +1727,29 @@ mod tests {
         // และเขียนต่อได้ปกติ
         store.put(&[(b"b", b"2")]).unwrap();
         assert_eq!(store.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn store_periodic_sync_bounds_loss_window_and_releases_lock_fast() {
+        let dir = temp_store("periodic");
+        {
+            let opts = crate::store::StoreOptions {
+                sync: false,
+                sync_interval_ms: 50, // sync ทุก 50ms โดย background thread
+                ..Default::default()
+            };
+            let store = XDBStore::open_opts(&dir, opts).unwrap();
+            for i in 0..50 {
+                store.put(&[(format!("p{i}").as_bytes(), b"v")]).unwrap();
+            }
+            assert_eq!(store.get(b"p49").unwrap(), Some(b"v".to_vec()));
+        }
+        // drop → thread ต้องออกทันที (condvar wake) → file lock ปลดเร็ว
+        let start = std::time::Instant::now();
+        let store = XDBStore::open(&dir).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "lock ต้องปลดเร็วหลัง drop");
+        assert_eq!(store.get(b"p0").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(store.get(b"p49").unwrap(), Some(b"v".to_vec()));
     }
 
     #[test]
