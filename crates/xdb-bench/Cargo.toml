@@ -1,0 +1,9 @@
+[package]
+name = "xdb-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+x-db = { path = "../.." }
+rusqlite = { version = "0.32", features = ["bundled"] }
+redb = "2"
