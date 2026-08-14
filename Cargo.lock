@@ -910,7 +910,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "x-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "xdb-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "redb",
  "rusqlite",
@@ -934,14 +934,14 @@ dependencies = [
 
 [[package]]
 name = "xdb-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "x-db",
 ]
 
 [[package]]
 name = "xdb-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "napi",
  "napi-build",
