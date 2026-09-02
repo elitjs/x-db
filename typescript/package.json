@@ -32,7 +32,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/d-osc/x-db"
+    "url": "https://github.com/elitjs/x-db"
   },
   "license": "MIT",
   "devDependencies": {

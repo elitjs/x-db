@@ -4,7 +4,7 @@ version = "0.3.1"
 edition = "2021"
 description = "Read-optimized embedded key-value store (SSTable-style): bloom filter + mmap + CRC, with a realtime layered store (LSM-lite)"
 license = "MIT"
-repository = "https://github.com/d-osc/x-db"
+repository = "https://github.com/elitjs/x-db"
 keywords = ["database", "key-value", "embedded", "mmap", "sst"]
 categories = ["database", "data-structures"]
 
