@@ -123,6 +123,10 @@ jobs:
         with:
           path: artifacts
 
+      - name: Get version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+
       - name: Assemble main package
         run: |
           mkdir -p typescript/dist
@@ -136,10 +140,10 @@ jobs:
       - name: Publish main package
         working-directory: typescript
         run: |
-          npm pkg set optionalDependencies["@elitjs/xdb-win32-x64-msvc"]="0.3.4"
-          npm pkg set optionalDependencies["@elitjs/xdb-linux-x64-gnu"]="0.3.4"
-          npm pkg set optionalDependencies["@elitjs/xdb-darwin-x64"]="0.3.4"
-          npm pkg set optionalDependencies["@elitjs/xdb-darwin-arm64"]="0.3.4"
+          npm pkg set optionalDependencies["@elitjs/xdb-win32-x64-msvc"]="${VERSION}"
+          npm pkg set optionalDependencies["@elitjs/xdb-linux-x64-gnu"]="${VERSION}"
+          npm pkg set optionalDependencies["@elitjs/xdb-darwin-x64"]="${VERSION}"
+          npm pkg set optionalDependencies["@elitjs/xdb-darwin-arm64"]="${VERSION}"
           npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

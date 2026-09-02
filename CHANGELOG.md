@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.5 (2026-09-03)
+
+- ย้าย repository ไป `elitjs/x-db` (แก้ URL ใน Cargo.toml + package.json)
+- Sync version ทั้ง Rust crates และ npm package เป็น 0.3.5
+- Release workflow: `optionalDependencies` ใช้ version จาก tag แทนการ hardcode
+
 ## v0.3.0 (2026-08-15)
 
 ### XDB — API เดียวจบ (TypeScript + Rust)
